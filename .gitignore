@@ -1,0 +1,17 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+.venv/
+
+# Secrets
+.env
+
+# Log history files
+history/
+
+# OS / Drive junk
+Thumbs.db
+desktop.ini
+.DS_Store
