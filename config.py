@@ -20,6 +20,9 @@ os.makedirs(HISTORY_DIR, exist_ok=True)
 
 # Safety checks (you’ll see these if env not set)
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set in .env")
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is not set (env var missing)")
 if not TELEGRAM_CHAT_ID:
-    raise RuntimeError("TELEGRAM_CHAT_ID is not set in .env")
+    raise RuntimeError("TELEGRAM_CHAT_ID is not set (env var missing)")
+
+
+
