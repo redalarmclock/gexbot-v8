@@ -48,6 +48,13 @@ class GexSnapshot:
     gamma_env_label: str         # e.g. "🔴 γ Short"
     comment: str                 # short environment comment
 
+    top_walls: str               # formatted list of top gamma walls
+    delta_trend: str             # rising / falling / stable hedging pressure
+    wide_range_flag: str         # note when ranges are very wide
+
+
+_last_delta: Optional[float] = None
+
 
 # ---------- HTTP helpers ----------
 
@@ -222,48 +229,6 @@ def _build_option_points(raw: Dict[str, Any]) -> List[OptionPoint]:
     return points
 
 
-def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
-    """Turn raw Deribit data into a single GEX snapshot."""
-
-    spot = float(raw["spot"])
-    now_ms = int(raw["now_ms"])
-    options = _build_option_points(raw)
-
-    if not options:
-        raise RuntimeError("No active BTC options with open interest returned from Deribit")
-
-    # Aggregate gamma / delta
-    net_gamma = sum(p.gamma_exposure for p in options)
-    net_delta = sum(p.delta_exposure for p in options)
-
-    # Aggregate by strike for magnets / walls
-    gex_by_strike: Dict[float, float] = {}
-    for p in options:
-        gex_by_strike[p.strike] = gex_by_strike.get(p.strike, 0.0) + p.gamma_exposure
-
-    magnet = _compute_magnet(gex_by_strike)
-    flip = _compute_flip(gex_by_strike)
-
-    near_range, strong_range = _compute_ranges(spot, gex_by_strike, net_gamma)
-
-    gamma_env, gamma_env_label, comment = _classify_environment(net_gamma)
-
-    return GexSnapshot(
-        spot=spot,
-        now_ms=now_ms,
-        options=options,
-        net_gamma=net_gamma,
-        net_delta=net_delta,
-        magnet=magnet,
-        flip=flip,
-        near_range=near_range,
-        strong_range=strong_range,
-        gamma_env=gamma_env,
-        gamma_env_label=gamma_env_label,
-        comment=comment,
-    )
-
-
 def _compute_magnet(gex_by_strike: Dict[float, float]) -> Optional[float]:
     if not gex_by_strike:
         return None
@@ -347,24 +312,130 @@ def _compute_ranges(
 
 def _classify_environment(net_gamma: float) -> Tuple[str, str, str]:
     abs_g = abs(net_gamma)
-    # Thresholds in BTC-gamma units are somewhat arbitrary; we only care about sign & "flat".
-    flat_threshold = 1e2  # treat very small exposures as flat
 
-    if abs_g < flat_threshold:
-        return "flat", "⚪ Flat γ", "Gamma neutral zone — expect chop / transition"
+    # Define meaningful gamma tiers
+    if abs_g < 1e2:
+        return "flat", "⚪ Flat γ", "Gamma neutral — expect chop."
 
-    if net_gamma < 0:
-        return (
-            "short",
-            "🔴 γ Short",
-            "Neg γ – expansion / whipsaw risk",
-        )
+    if net_gamma < 0:  # Short gamma
+        if abs_g < 10_000_000:
+            label = "🔴 γ Short (Mild)"
+            comment = "Mild neg γ — some whipsaw risk."
+        elif abs_g < 25_000_000:
+            label = "🔴 γ Short (Elevated)"
+            comment = "Elevated neg γ — expansion and trap risk."
+        else:
+            label = "🔴 γ Short (Extreme)"
+            comment = "Extreme neg γ — large moves, high whipsaw risk."
+
+        return "short", label, comment
+
+    else:  # Long gamma
+        if abs_g < 10_000_000:
+            label = "🟢 γ Long (Mild)"
+            comment = "Mild pos γ — weak mean-revert bias."
+        elif abs_g < 25_000_000:
+            label = "🟢 γ Long (Elevated)"
+            comment = "Elevated pos γ — strong dampening effect."
+        else:
+            label = "🟢 γ Long (Extreme)"
+            comment = "Extreme pos γ — strong lean to mean-reversion."
+
+        return "long", label, comment
+
+
+def _top_gamma_walls(gex_by_strike: Dict[float, float], top_n: int = 5) -> str:
+    """Return formatted list of top positive/negative gamma walls."""
+    if not gex_by_strike:
+        return "—"
+
+    # Sort by absolute gamma, descending
+    sorted_walls = sorted(
+        gex_by_strike.items(), key=lambda x: abs(x[1]), reverse=True
+    )[:top_n]
+
+    lines: List[str] = []
+    for strike, gex in sorted_walls:
+        gex_m = gex / 1_000_000
+        direction = "R" if gex < 0 else "S"
+        lines.append(f"{int(strike):,} ({gex_m:.2f}M {direction})")
+
+    return " | ".join(lines)
+
+
+def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
+    """Turn raw Deribit data into a single GEX snapshot."""
+
+    global _last_delta
+
+    spot = float(raw["spot"])
+    now_ms = int(raw["now_ms"])
+    options = _build_option_points(raw)
+
+    if not options:
+        raise RuntimeError("No active BTC options with open interest returned from Deribit")
+
+    # Aggregate gamma / delta
+    net_gamma = sum(p.gamma_exposure for p in options)
+    net_delta = sum(p.delta_exposure for p in options)
+
+    # Delta trend
+    if _last_delta is None:
+        delta_trend = "Δ baseline — first sample."
     else:
-        return (
-            "long",
-            "🟢 γ Long",
-            "Pos γ – dealer dampening, mean-revert bias",
-        )
+        if net_delta > _last_delta:
+            delta_trend = "Delta rising — stronger hedging pressure."
+        elif net_delta < _last_delta:
+            delta_trend = "Delta falling — hedging pressure easing."
+        else:
+            delta_trend = "Delta stable — hedging unchanged."
+    _last_delta = net_delta
+
+    # Aggregate by strike for magnets / walls
+    gex_by_strike: Dict[float, float] = {}
+    for p in options:
+        gex_by_strike[p.strike] = gex_by_strike.get(p.strike, 0.0) + p.gamma_exposure
+
+    magnet = _compute_magnet(gex_by_strike)
+    flip = _compute_flip(gex_by_strike)
+
+    near_range, strong_range = _compute_ranges(spot, gex_by_strike, net_gamma)
+    top_walls = _top_gamma_walls(gex_by_strike)
+
+    # Wide range flag based on Near range width (rounded levels)
+    wide_range_flag = ""
+    try:
+        low_str, high_str = near_range.split("/")
+        if "—" not in low_str and "—" not in high_str:
+            # Strip suffix R/S if present
+            low_clean = low_str[:-1] if low_str.endswith(("R", "S")) else low_str
+            high_clean = high_str[:-1] if high_str.endswith(("R", "S")) else high_str
+            low_v = int(low_clean)
+            high_v = int(high_clean)
+            if abs(high_v - low_v) >= 4_000:
+                wide_range_flag = "Wide chop zone — dispersed walls."
+    except Exception:
+        wide_range_flag = ""
+
+    gamma_env, gamma_env_label, comment = _classify_environment(net_gamma)
+
+    return GexSnapshot(
+        spot=spot,
+        now_ms=now_ms,
+        options=options,
+        net_gamma=net_gamma,
+        net_delta=net_delta,
+        magnet=magnet,
+        flip=flip,
+        near_range=near_range,
+        strong_range=strong_range,
+        gamma_env=gamma_env,
+        gamma_env_label=gamma_env_label,
+        comment=comment,
+        top_walls=top_walls,
+        delta_trend=delta_trend,
+        wide_range_flag=wide_range_flag,
+    )
 
 
 # ---------- Formatting helpers for bot & history ----------
@@ -379,7 +450,13 @@ def _fmt_price(p: Optional[float]) -> str:
 def format_ultra(snapshot: GexSnapshot) -> str:
     """One-liner style print for the fast 'ultra' feed."""
     spot_s = _fmt_price(snapshot.spot)
-    flip_s = _fmt_price(snapshot.flip)
+
+    # Flip suppression logic: hide if too far from spot (>25%)
+    if snapshot.flip is not None and abs(snapshot.flip - snapshot.spot) / snapshot.spot <= 0.25:
+        flip_s = _fmt_price(snapshot.flip)
+    else:
+        flip_s = "—"
+
     mag_s = _fmt_price(snapshot.magnet)
 
     delta_s = f"{snapshot.net_delta:,.0f}"
@@ -397,14 +474,20 @@ def format_ultra(snapshot: GexSnapshot) -> str:
 def format_pretty(snapshot: GexSnapshot) -> str:
     """More verbose block for the 'pretty' 15m feed."""
     spot_s = _fmt_price(snapshot.spot)
-    flip_s = _fmt_price(snapshot.flip)
+
+    # Flip suppression logic: hide if too far from spot (>25%)
+    if snapshot.flip is not None and abs(snapshot.flip - snapshot.spot) / snapshot.spot <= 0.25:
+        flip_s = _fmt_price(snapshot.flip)
+    else:
+        flip_s = "—"
+
     mag_s = _fmt_price(snapshot.magnet)
 
     delta_s = f"{snapshot.net_delta:,.0f}"
     gamma_m = snapshot.net_gamma / 1_000_000.0
     gamma_s = f"{gamma_m:.2f}M"
 
-    lines = [
+    lines: List[str] = [
         f"📊 {DERIBIT_CURRENCY} GEX Update | Spot {spot_s}",
         "",
         f"• Environment: {snapshot.gamma_env_label} – {snapshot.comment}",
@@ -412,6 +495,13 @@ def format_pretty(snapshot: GexSnapshot) -> str:
         f"• Net Γ: {gamma_s} | Δ: {delta_s}",
         f"• Near: {snapshot.near_range} | Strong: {snapshot.strong_range}",
     ]
+
+    if snapshot.wide_range_flag:
+        lines.append(f"• Range note: {snapshot.wide_range_flag}")
+
+    lines.append(f"• Walls: {snapshot.top_walls}")
+    lines.append(f"• Δ trend: {snapshot.delta_trend}")
+
     return "\n".join(lines)
 
 
@@ -429,6 +519,9 @@ def snapshot_to_ultra_row(snapshot: GexSnapshot) -> Dict[str, Any]:
         "near_range": snapshot.near_range,
         "strong_range": snapshot.strong_range,
         "comment": snapshot.comment,
+        "top_walls": snapshot.top_walls,
+        "delta_trend": snapshot.delta_trend,
+        "wide_range_flag": snapshot.wide_range_flag,
     }
 
 
