@@ -1,4 +1,9 @@
 # history_bot.py
+
+from sheets_utils import append_ultra_row, append_pretty_row
+from datetime import datetime
+
+
 import csv
 import os
 from datetime import datetime
@@ -13,7 +18,7 @@ def _ensure_file_header(path: str, header: list[str]) -> None:
             writer.writerow(header)
 
 def log_ultra(row: Dict[str, Any]) -> None:
-    """Log a single ultra 5-min print to CSV."""
+    """Log a single ultra 5-min print to CSV + Google Sheets."""
     header = [
         "timestamp_iso",
         "spot",
@@ -27,22 +32,30 @@ def log_ultra(row: Dict[str, Any]) -> None:
     ]
     _ensure_file_header(HISTORY_ULTRA_FILE, header)
 
+    timestamp = datetime.utcnow().isoformat()
+
+    csv_values = [
+        timestamp,
+        row.get("spot"),
+        row.get("gamma_sign"),
+        row.get("gamma_flip"),
+        row.get("magnet"),
+        row.get("delta"),
+        row.get("net_gamma"),
+        row.get("near_range"),
+        row.get("strong_range"),
+    ]
+
+    # Write to local CSV
     with open(HISTORY_ULTRA_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            datetime.utcnow().isoformat(),
-            row.get("spot"),
-            row.get("gamma_sign"),
-            row.get("gamma_flip"),
-            row.get("magnet"),
-            row.get("delta"),
-            row.get("net_gamma"),
-            row.get("near_range"),
-            row.get("strong_range"),
-        ])
+        writer.writerow(csv_values)
+
+    # Also push to Google Sheets
+    append_ultra_row(csv_values)
 
 def log_pretty(row: Dict[str, Any]) -> None:
-    """Log a single pretty 15-min print to CSV."""
+    """Log a single pretty 15-min print to CSV + Google Sheets."""
     header = [
         "timestamp_iso",
         "spot",
@@ -54,14 +67,22 @@ def log_pretty(row: Dict[str, Any]) -> None:
     ]
     _ensure_file_header(HISTORY_PRETTY_FILE, header)
 
+    timestamp = datetime.utcnow().isoformat()
+
+    csv_values = [
+        timestamp,
+        row.get("spot"),
+        row.get("gamma_env_label"),
+        row.get("magnet"),
+        row.get("delta"),
+        row.get("net_gamma"),
+        row.get("comment"),
+    ]
+
+    # Write to local CSV
     with open(HISTORY_PRETTY_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            datetime.utcnow().isoformat(),
-            row.get("spot"),
-            row.get("gamma_env_label"),
-            row.get("magnet"),
-            row.get("delta"),
-            row.get("net_gamma"),
-            row.get("comment"),
-        ])
+        writer.writerow(csv_values)
+
+    # Also push to Google Sheets
+    append_pretty_row(csv_values)
