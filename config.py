@@ -18,6 +18,15 @@ HISTORY_PRETTY_FILE = os.path.join(HISTORY_DIR, "pretty_15m.csv")
 
 os.makedirs(HISTORY_DIR, exist_ok=True)
 
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+
+ULTRA_SPREADSHEET_ID = os.getenv("ULTRA_SPREADSHEET_ID")
+PRETTY_SPREADSHEET_ID = os.getenv("PRETTY_SPREADSHEET_ID")
+ULTRA_SHEET_NAME = os.getenv("ULTRA_SHEET_NAME", "Ultra")
+PRETTY_SHEET_NAME = os.getenv("PRETTY_SHEET_NAME", "Pretty")
+
+
+
 # Safety checks (you’ll see these if env not set)
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is not set (env var missing)")
