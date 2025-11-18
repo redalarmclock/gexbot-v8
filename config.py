@@ -4,6 +4,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
+# --- Deribit API config ---
+DERIBIT_CLIENT_ID = os.getenv("DERIBIT_CLIENT_ID")
+DERIBIT_CLIENT_SECRET = os.getenv("DERIBIT_CLIENT_SECRET")
+DERIBIT_BASE_URL = os.getenv("DERIBIT_BASE_URL", "https://www.deribit.com")
+
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "@btcgexbot")
 
@@ -24,6 +31,7 @@ ULTRA_SPREADSHEET_ID = os.getenv("ULTRA_SPREADSHEET_ID")
 PRETTY_SPREADSHEET_ID = os.getenv("PRETTY_SPREADSHEET_ID")
 ULTRA_SHEET_NAME = os.getenv("ULTRA_SHEET_NAME", "Ultra")
 PRETTY_SHEET_NAME = os.getenv("PRETTY_SHEET_NAME", "Pretty")
+
 
 
 
