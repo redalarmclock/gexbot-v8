@@ -49,11 +49,14 @@ class GexSnapshot:
     comment: str                 # short environment comment
 
     top_walls: str               # formatted list of top gamma walls
-    delta_trend: str             # rising / falling / stable hedging pressure
+    delta_trend: str             # short-term hedging pressure
+    delta_trend_long: str        # ~1h hedging pressure trend
     wide_range_flag: str         # note when ranges are very wide
+    interpretation: str          # one-liner summary
 
 
 _last_delta: Optional[float] = None
+_delta_history: List[Tuple[int, float]] = []  # (timestamp_ms, net_delta)
 
 
 # ---------- HTTP helpers ----------
@@ -363,10 +366,91 @@ def _top_gamma_walls(gex_by_strike: Dict[float, float], top_n: int = 5) -> str:
     return " | ".join(lines)
 
 
+def _describe_delta_trend(diff: float, ref: float) -> str:
+    """Convert delta difference into a human-readable trend."""
+    if ref == 0:
+        ref = 1.0
+    rel = abs(diff) / abs(ref)
+
+    # Small absolute + small relative move -> stable
+    if abs(diff) < 1000 and rel < 0.03:
+        return "Delta stable — hedging unchanged."
+    elif diff > 0:
+        return "Delta rising — stronger hedging pressure."
+    else:
+        return "Delta falling — hedging pressure easing."
+
+
+def _build_interpretation(
+    spot: float,
+    gamma_env: str,
+    near_range: str,
+    top_walls: str,
+    wide_range_flag: str,
+) -> str:
+    """Generate a one-liner summary from walls + environment."""
+    if not top_walls or top_walls == "—":
+        return "No dominant walls — GEX structure light; behaviour driven more by flows than walls."
+
+    # Primary wall: first entry in top_walls
+    primary = top_walls.split(" | ")[0]
+    strike_label = "key level"
+    direction = ""
+
+    try:
+        strike_str, _rest = primary.split(" ", 1)
+        strike_clean = strike_str.replace(",", "")
+        strike_val = int(strike_clean)
+        strike_label = f"{strike_val // 1000}k"
+        if " R)" in primary:
+            direction = "R"
+        elif " S)" in primary:
+            direction = "S"
+    except Exception:
+        pass
+
+    # Derive band from near_range
+    band = ""
+    try:
+        low_str, high_str = near_range.split("/")
+        if "—" not in low_str and "—" not in high_str:
+            low_clean = low_str[:-1] if low_str.endswith(("R", "S")) else low_str
+            high_clean = high_str[:-1] if high_str.endswith(("R", "S")) else high_str
+            low_v = int(low_clean)
+            high_v = int(high_clean)
+            band = f"{low_v // 1000}–{high_v // 1000}k"
+    except Exception:
+        band = ""
+
+    # Behaviour based on gamma environment + width
+    if gamma_env == "short":
+        if wide_range_flag:
+            behaviour = "wide negative-gamma chop with sharp moves across the zone."
+        else:
+            behaviour = "negative-gamma chop with potential sharp squeezes."
+    elif gamma_env == "long":
+        behaviour = "mean-reversion towards the magnet with dampened swings."
+    else:
+        behaviour = "choppy, transition-type price action."
+
+    # Direction label
+    if direction == "R":
+        wall_desc = "major R wall"
+    elif direction == "S":
+        wall_desc = "major S wall"
+    else:
+        wall_desc = "major wall"
+
+    if band:
+        return f"{wall_desc} at {strike_label} with nearby walls across {band} — expect {behaviour}"
+    else:
+        return f"{wall_desc} at {strike_label} — expect {behaviour}"
+
+
 def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
     """Turn raw Deribit data into a single GEX snapshot."""
 
-    global _last_delta
+    global _last_delta, _delta_history
 
     spot = float(raw["spot"])
     now_ms = int(raw["now_ms"])
@@ -379,19 +463,35 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
     net_gamma = sum(p.gamma_exposure for p in options)
     net_delta = sum(p.delta_exposure for p in options)
 
-    # Delta trend
+    # ---------- Delta trends ----------
+
+    # Short-term: compare to previous snapshot
     if _last_delta is None:
-        delta_trend = "Δ baseline — first sample."
+        delta_trend_short = "Δ baseline — first sample."
     else:
-        if net_delta > _last_delta:
-            delta_trend = "Delta rising — stronger hedging pressure."
-        elif net_delta < _last_delta:
-            delta_trend = "Delta falling — hedging pressure easing."
-        else:
-            delta_trend = "Delta stable — hedging unchanged."
+        diff_short = net_delta - _last_delta
+        delta_trend_short = _describe_delta_trend(diff_short, _last_delta)
     _last_delta = net_delta
 
-    # Aggregate by strike for magnets / walls
+    # Update history for long-term trend (~1h)
+    _delta_history.append((now_ms, net_delta))
+    # prune older than 2h
+    cutoff = now_ms - 2 * 3600_000
+    _delta_history = [(t, d) for (t, d) in _delta_history if t >= cutoff]
+
+    # Find reference ~1h ago (closest entry at or before now - 1h)
+    target = now_ms - 3600_000
+    past_candidates = [(t, d) for (t, d) in _delta_history if t <= target]
+
+    if not past_candidates:
+        delta_trend_long = "Δ (1h) baseline — insufficient history."
+    else:
+        ref_t, ref_delta = max(past_candidates, key=lambda x: x[0])
+        diff_long = net_delta - ref_delta
+        delta_trend_long = _describe_delta_trend(diff_long, ref_delta)
+
+    # ---------- Gamma / walls / ranges ----------
+
     gex_by_strike: Dict[float, float] = {}
     for p in options:
         gex_by_strike[p.strike] = gex_by_strike.get(p.strike, 0.0) + p.gamma_exposure
@@ -419,6 +519,14 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
 
     gamma_env, gamma_env_label, comment = _classify_environment(net_gamma)
 
+    interpretation = _build_interpretation(
+        spot=spot,
+        gamma_env=gamma_env,
+        near_range=near_range,
+        top_walls=top_walls,
+        wide_range_flag=wide_range_flag,
+    )
+
     return GexSnapshot(
         spot=spot,
         now_ms=now_ms,
@@ -433,8 +541,10 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
         gamma_env_label=gamma_env_label,
         comment=comment,
         top_walls=top_walls,
-        delta_trend=delta_trend,
+        delta_trend=delta_trend_short,
+        delta_trend_long=delta_trend_long,
         wide_range_flag=wide_range_flag,
+        interpretation=interpretation,
     )
 
 
@@ -500,7 +610,9 @@ def format_pretty(snapshot: GexSnapshot) -> str:
         lines.append(f"• Range note: {snapshot.wide_range_flag}")
 
     lines.append(f"• Walls: {snapshot.top_walls}")
-    lines.append(f"• Δ trend: {snapshot.delta_trend}")
+    lines.append(f"• Δ trend (short): {snapshot.delta_trend}")
+    lines.append(f"• Δ trend (1h): {snapshot.delta_trend_long}")
+    lines.append(f"• Interpretation: {snapshot.interpretation}")
 
     return "\n".join(lines)
 
@@ -520,8 +632,10 @@ def snapshot_to_ultra_row(snapshot: GexSnapshot) -> Dict[str, Any]:
         "strong_range": snapshot.strong_range,
         "comment": snapshot.comment,
         "top_walls": snapshot.top_walls,
-        "delta_trend": snapshot.delta_trend,
+        "delta_trend_short": snapshot.delta_trend,
+        "delta_trend_long": snapshot.delta_trend_long,
         "wide_range_flag": snapshot.wide_range_flag,
+        "interpretation": snapshot.interpretation,
     }
 
 
