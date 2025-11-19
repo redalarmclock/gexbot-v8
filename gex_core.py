@@ -541,8 +541,10 @@ def _compute_bounce_map(
     """
     Build a qualitative 'bounce map' from the lower strong-band wall.
 
-    Example:
-      '90k tag — very likely → 90.6k rebound — high → 91.4k extension — medium → 92.5k stretch — low'
+    Stateless, but stage-aware based on *current spot*:
+      - If spot <= tag   → tag not done
+      - If spot > tag    → tag marked 'done'
+      - If spot > rebound / extension / mid → those are marked 'in play' or 'done'
     """
     # Only meaningful in short-gamma regimes with a valid band
     if gamma_env != "short" or not strong_range or strong_range == "—/—":
@@ -578,13 +580,13 @@ def _compute_bounce_map(
     strong_delta = abs_delta >= 40_000
     very_strong_delta = abs_delta >= 55_000
 
-    # Define key levels from the lower band edge
+    # Key ladder levels from the lower band edge
     lvl_tag = low_v
     lvl_rebound = low_v * 1.006   # ~0.6% bounce
     lvl_extend = low_v * 1.014   # ~1.4% extension
     lvl_mid = (low_v + high_v) / 2.0
 
-    # Qualitative labels
+    # Baseline qualitative odds (used when a level is not yet "done" / "in play")
     tag_prob = "very likely"
     if extreme_gamma and very_strong_delta:
         rebound_prob = "high"
@@ -599,12 +601,49 @@ def _compute_bounce_map(
         extend_prob = "low"
         mid_prob = "low"
 
-    tag_s = f"{_fmt_k_level(lvl_tag)} tag — {tag_prob}"
-    rebound_s = f"{_fmt_k_level(lvl_rebound)} rebound — {rebound_prob}"
-    extend_s = f"{_fmt_k_level(lvl_extend)} extension — {extend_prob}"
-    mid_s = f"{_fmt_k_level(lvl_mid)} stretch — {mid_prob}"
+    # Stateless "stage" from current spot location
+    # 0: ≤ tag, 1: >tag, 2: >rebound, 3: >extension, 4: >mid
+    stage = 0
+    if spot > lvl_tag:
+        stage = 1
+    if spot > lvl_rebound:
+        stage = 2
+    if spot > lvl_extend:
+        stage = 3
+    if spot > lvl_mid:
+        stage = 4
 
-    return f"{tag_s} → {rebound_s} → {extend_s} → {mid_s}"
+    # --- Build labels with stage awareness ---
+
+    # Tag: either still probabilistic, or already effectively done
+    if stage == 0:
+        tag_desc = f"{_fmt_k_level(lvl_tag)} tag — {tag_prob}"
+    else:
+        tag_desc = f"{_fmt_k_level(lvl_tag)} tag — done"
+
+    # Rebound: probability until crossed; then "in play" or "done"
+    if stage <= 1:
+        rebound_desc = f"{_fmt_k_level(lvl_rebound)} rebound — {rebound_prob}"
+    elif stage == 2:
+        rebound_desc = f"{_fmt_k_level(lvl_rebound)} rebound — in play"
+    else:
+        rebound_desc = f"{_fmt_k_level(lvl_rebound)} rebound — done"
+
+    # Extension: probability until crossed; then "in play" or "done"
+    if stage <= 2:
+        extend_desc = f"{_fmt_k_level(lvl_extend)} extension — {extend_prob}"
+    elif stage == 3:
+        extend_desc = f"{_fmt_k_level(lvl_extend)} extension — in play"
+    else:
+        extend_desc = f"{_fmt_k_level(lvl_extend)} extension — done"
+
+    # Mid / stretch: probability until we're beyond mid; then "in play"
+    if stage < 4:
+        mid_desc = f"{_fmt_k_level(lvl_mid)} stretch — {mid_prob}"
+    else:
+        mid_desc = f"{_fmt_k_level(lvl_mid)} stretch — in play"
+
+    return f"{tag_desc} → {rebound_desc} → {extend_desc} → {mid_desc}"
 
 
 def _build_interpretation(
@@ -853,10 +892,18 @@ def format_pretty(snapshot: GexSnapshot) -> str:
     lines.append(f"• Walls: {snapshot.top_walls}")
     if snapshot.band_walls and snapshot.band_walls != "—":
         lines.append(f"• Band walls: {snapshot.band_walls}")
+        # Band bias + optional note
     if snapshot.band_bias and snapshot.band_bias != "—":
         lines.append(f"• Band bias: {snapshot.band_bias}")
-    if snapshot.band_bias_interpretation and snapshot.band_bias_interpretation != "—":
-        lines.append(f"• Bias note: {snapshot.band_bias_interpretation}")
+
+        # Only show bias note when band is not balanced; otherwise it adds noise.
+        if (
+            snapshot.band_bias_interpretation
+            and snapshot.band_bias_interpretation != "—"
+            and "balanced" not in snapshot.band_bias.lower()
+        ):
+            lines.append(f"• Bias note: {snapshot.band_bias_interpretation}")
+
     if snapshot.bounce_map and snapshot.bounce_map != "—":
         lines.append(f"• Bounce map: {snapshot.bounce_map}")
     lines.append(f"• Δ trend (short): {snapshot.delta_trend}")
