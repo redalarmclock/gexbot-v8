@@ -48,7 +48,8 @@ class GexSnapshot:
     gamma_env_label: str         # e.g. "🔴 γ Short"
     comment: str                 # short environment comment
 
-    top_walls: str               # formatted list of top gamma walls
+    top_walls: str               # formatted list of top gamma walls (global)
+    band_walls: str              # formatted list of walls inside strong band
     delta_trend: str             # short-term hedging pressure
     delta_trend_long: str        # ~1h hedging pressure trend
     wide_range_flag: str         # note when ranges are very wide
@@ -357,13 +358,62 @@ def _top_gamma_walls(gex_by_strike: Dict[float, float], top_n: int = 5) -> str:
         gex_by_strike.items(), key=lambda x: abs(x[1]), reverse=True
     )[:top_n]
 
-    lines: List[str] = []
+    parts: List[str] = []
     for strike, gex in sorted_walls:
         gex_m = gex / 1_000_000
         direction = "R" if gex < 0 else "S"
-        lines.append(f"{int(strike):,} ({gex_m:.2f}M {direction})")
+        parts.append(f"{int(strike):,} ({gex_m:.2f}M {direction})")
 
-    return " | ".join(lines)
+    return " | ".join(parts)
+
+
+def _compute_band_walls(strong_range: str, gex_by_strike: Dict[float, float]) -> str:
+    """
+    Return a compressed list of walls *inside* the strong band,
+    sorted by strike ascending, limited to the most relevant few.
+    """
+    if not gex_by_strike:
+        return "—"
+    if strong_range == "—/—":
+        return "—"
+
+    try:
+        low_str, high_str = strong_range.split("/")
+        if "—" in low_str or "—" in high_str:
+            return "—"
+
+        # Strip trailing R/S if present
+        if low_str.endswith(("R", "S")):
+            low_str = low_str[:-1]
+        if high_str.endswith(("R", "S")):
+            high_str = high_str[:-1]
+
+        low_v = int(low_str)
+        high_v = int(high_str)
+        if low_v > high_v:
+            low_v, high_v = high_v, low_v
+    except Exception:
+        return "—"
+
+    # Select strikes inside the band
+    band_items = [(k, v) for k, v in gex_by_strike.items() if low_v <= k <= high_v]
+    if not band_items:
+        return "—"
+
+    # If too many strikes, take the top few by |gamma|, then sort by strike
+    if len(band_items) > 6:
+        band_items = sorted(band_items, key=lambda x: abs(x[1]), reverse=True)[:6]
+
+    band_items = sorted(band_items, key=lambda x: x[0])
+
+    parts: List[str] = []
+    for strike, gex in band_items:
+        strike_k = int(round(strike / 1000.0))
+        direction = "R" if gex < 0 else "S"
+        gex_m = abs(gex) / 1_000_000.0
+        parts.append(f"{strike_k}k{direction} ({gex_m:.1f}M)")
+
+    return " | ".join(parts)
 
 
 def _describe_delta_trend(diff: float, ref: float) -> str:
@@ -501,6 +551,7 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
 
     near_range, strong_range = _compute_ranges(spot, gex_by_strike, net_gamma)
     top_walls = _top_gamma_walls(gex_by_strike)
+    band_walls = _compute_band_walls(strong_range, gex_by_strike)
 
     # Wide range flag based on Near range width (rounded levels)
     wide_range_flag = ""
@@ -541,6 +592,7 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
         gamma_env_label=gamma_env_label,
         comment=comment,
         top_walls=top_walls,
+        band_walls=band_walls,
         delta_trend=delta_trend_short,
         delta_trend_long=delta_trend_long,
         wide_range_flag=wide_range_flag,
@@ -610,6 +662,8 @@ def format_pretty(snapshot: GexSnapshot) -> str:
         lines.append(f"• Range note: {snapshot.wide_range_flag}")
 
     lines.append(f"• Walls: {snapshot.top_walls}")
+    if snapshot.band_walls and snapshot.band_walls != "—":
+        lines.append(f"• Band walls: {snapshot.band_walls}")
     lines.append(f"• Δ trend (short): {snapshot.delta_trend}")
     lines.append(f"• Δ trend (1h): {snapshot.delta_trend_long}")
     lines.append(f"• Interpretation: {snapshot.interpretation}")
@@ -632,6 +686,7 @@ def snapshot_to_ultra_row(snapshot: GexSnapshot) -> Dict[str, Any]:
         "strong_range": snapshot.strong_range,
         "comment": snapshot.comment,
         "top_walls": snapshot.top_walls,
+        "band_walls": snapshot.band_walls,
         "delta_trend_short": snapshot.delta_trend,
         "delta_trend_long": snapshot.delta_trend_long,
         "wide_range_flag": snapshot.wide_range_flag,
