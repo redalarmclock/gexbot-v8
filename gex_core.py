@@ -371,6 +371,10 @@ def _compute_band_walls(strong_range: str, gex_by_strike: Dict[float, float]) ->
     """
     Return a compressed list of walls *inside* the strong band,
     sorted by strike ascending, limited to the most relevant few.
+
+    Rules:
+      - Only include walls with |gamma| >= 500M (0.5B).
+      - Show at most the top 4 strongest by |gamma|.
     """
     if not gex_by_strike:
         return "—"
@@ -400,10 +404,14 @@ def _compute_band_walls(strong_range: str, gex_by_strike: Dict[float, float]) ->
     if not band_items:
         return "—"
 
-    # If too many strikes, take the top few by |gamma|, then sort by strike
-    if len(band_items) > 6:
-        band_items = sorted(band_items, key=lambda x: abs(x[1]), reverse=True)[:6]
+    # Apply 500M absolute gamma threshold (0.5B)
+    threshold = 500_000_000.0
+    band_items = [(k, v) for k, v in band_items if abs(v) >= threshold]
+    if not band_items:
+        return "—"
 
+    # Take the top 4 by |gamma|, then sort by strike ascending
+    band_items = sorted(band_items, key=lambda x: abs(x[1]), reverse=True)[:4]
     band_items = sorted(band_items, key=lambda x: x[0])
 
     parts: List[str] = []
