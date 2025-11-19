@@ -56,6 +56,7 @@ class GexSnapshot:
     delta_trend_long: str        # ~1h hedging pressure trend
     wide_range_flag: str         # note when ranges are very wide
     interpretation: str          # one-liner summary
+    bounce_map: str              # qualitative bounce map from lower band
 
 
 _last_delta: Optional[float] = None
@@ -516,6 +517,96 @@ def _interpret_band_bias(band_bias: str) -> str:
     return "Band bias unclear."
 
 
+def _fmt_k_level(price: float) -> str:
+    """
+    Format a price like 90540 as '90.5k', 90000 as '90k'.
+    """
+    if price <= 0 or math.isnan(price):
+        return "—"
+    rounded = round(price / 100.0) * 100  # nearest 100
+    k = rounded / 1000.0
+    if abs(rounded % 1000) < 1e-6:
+        return f"{k:.0f}k"
+    else:
+        return f"{k:.1f}k"
+
+
+def _compute_bounce_map(
+    spot: float,
+    strong_range: str,
+    gamma_env: str,
+    net_gamma: float,
+    net_delta: float,
+) -> str:
+    """
+    Build a qualitative 'bounce map' from the lower strong-band wall.
+
+    Example:
+      '90k tag — very likely → 90.6k rebound — high → 91.4k extension — medium → 92.5k stretch — low'
+    """
+    # Only meaningful in short-gamma regimes with a valid band
+    if gamma_env != "short" or not strong_range or strong_range == "—/—":
+        return "Map only shown in short-γ with defined strong band."
+
+    try:
+        low_str, high_str = strong_range.split("/")
+        if "—" in low_str or "—" in high_str:
+            return "Map only shown in short-γ with defined strong band."
+
+        # Strip trailing R/S if present
+        if low_str.endswith(("R", "S")):
+            low_str = low_str[:-1]
+        if high_str.endswith(("R", "S")):
+            high_str = high_str[:-1]
+
+        low_v = int(low_str)
+        high_v = int(high_str)
+        if low_v > high_v:
+            low_v, high_v = high_v, low_v
+    except Exception:
+        return "Map unavailable (bad band)."
+
+    # Only show if spot is at least in the vicinity of the band
+    if spot < low_v - 2_000 or spot > high_v + 2_000:
+        return "Map focuses on reactions from the lower band; spot currently far from band."
+
+    abs_gamma = abs(net_gamma)
+    abs_delta = abs(net_delta)
+
+    # Define tiers based on magnitude
+    extreme_gamma = abs_gamma >= 25_000_000
+    strong_delta = abs_delta >= 40_000
+    very_strong_delta = abs_delta >= 55_000
+
+    # Define key levels from the lower band edge
+    lvl_tag = low_v
+    lvl_rebound = low_v * 1.006   # ~0.6% bounce
+    lvl_extend = low_v * 1.014   # ~1.4% extension
+    lvl_mid = (low_v + high_v) / 2.0
+
+    # Qualitative labels
+    tag_prob = "very likely"
+    if extreme_gamma and very_strong_delta:
+        rebound_prob = "high"
+        extend_prob = "medium"
+        mid_prob = "low"
+    elif extreme_gamma and strong_delta:
+        rebound_prob = "high"
+        extend_prob = "medium"
+        mid_prob = "low"
+    else:
+        rebound_prob = "medium"
+        extend_prob = "low"
+        mid_prob = "low"
+
+    tag_s = f"{_fmt_k_level(lvl_tag)} tag — {tag_prob}"
+    rebound_s = f"{_fmt_k_level(lvl_rebound)} rebound — {rebound_prob}"
+    extend_s = f"{_fmt_k_level(lvl_extend)} extension — {extend_prob}"
+    mid_s = f"{_fmt_k_level(lvl_mid)} stretch — {mid_prob}"
+
+    return f"{tag_s} → {rebound_s} → {extend_s} → {mid_s}"
+
+
 def _build_interpretation(
     spot: float,
     gamma_env: str,
@@ -665,6 +756,14 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
         wide_range_flag=wide_range_flag,
     )
 
+    bounce_map = _compute_bounce_map(
+        spot=spot,
+        strong_range=strong_range,
+        gamma_env=gamma_env,
+        net_gamma=net_gamma,
+        net_delta=net_delta,
+    )
+
     return GexSnapshot(
         spot=spot,
         now_ms=now_ms,
@@ -686,6 +785,7 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
         delta_trend_long=delta_trend_long,
         wide_range_flag=wide_range_flag,
         interpretation=interpretation,
+        bounce_map=bounce_map,
     )
 
 
@@ -757,6 +857,8 @@ def format_pretty(snapshot: GexSnapshot) -> str:
         lines.append(f"• Band bias: {snapshot.band_bias}")
     if snapshot.band_bias_interpretation and snapshot.band_bias_interpretation != "—":
         lines.append(f"• Bias note: {snapshot.band_bias_interpretation}")
+    if snapshot.bounce_map and snapshot.bounce_map != "—":
+        lines.append(f"• Bounce map: {snapshot.bounce_map}")
     lines.append(f"• Δ trend (short): {snapshot.delta_trend}")
     lines.append(f"• Δ trend (1h): {snapshot.delta_trend_long}")
     lines.append(f"• Interpretation: {snapshot.interpretation}")
@@ -786,6 +888,7 @@ def snapshot_to_ultra_row(snapshot: GexSnapshot) -> Dict[str, Any]:
         "delta_trend_long": snapshot.delta_trend_long,
         "wide_range_flag": snapshot.wide_range_flag,
         "interpretation": snapshot.interpretation,
+        "bounce_map": snapshot.bounce_map,
     }
 
 
