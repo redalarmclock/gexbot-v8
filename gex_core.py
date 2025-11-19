@@ -50,6 +50,8 @@ class GexSnapshot:
 
     top_walls: str               # formatted list of top gamma walls (global)
     band_walls: str              # formatted list of walls inside strong band
+    band_bias: str               # bias of gamma mass within the strong band
+    band_bias_interpretation: str  # human interpretation of band bias
     delta_trend: str             # short-term hedging pressure
     delta_trend_long: str        # ~1h hedging pressure trend
     wide_range_flag: str         # note when ranges are very wide
@@ -424,6 +426,62 @@ def _compute_band_walls(strong_range: str, gex_by_strike: Dict[float, float]) ->
     return " | ".join(parts)
 
 
+def _compute_band_bias(strong_range: str, gex_by_strike: Dict[float, float]) -> str:
+    """
+    Compute whether the strong band is lower-heavy, upper-heavy, or balanced.
+    Uses absolute gamma exposure inside the band.
+    """
+    if not gex_by_strike or strong_range == "—/—":
+        return "—"
+
+    try:
+        low_str, high_str = strong_range.split("/")
+        if "—" in low_str or "—" in high_str:
+            return "—"
+
+        # Remove R/S
+        if low_str.endswith(("R", "S")):
+            low_str = low_str[:-1]
+        if high_str.endswith(("R", "S")):
+            high_str = high_str[:-1]
+
+        low_v = int(low_str)
+        high_v = int(high_str)
+        if low_v > high_v:
+            low_v, high_v = high_v, low_v
+    except Exception:
+        return "—"
+
+    mid = (low_v + high_v) / 2.0
+
+    lower_vals: List[float] = []
+    upper_vals: List[float] = []
+
+    for strike, gex in gex_by_strike.items():
+        if strike < low_v or strike > high_v:
+            continue
+        if strike <= mid:
+            lower_vals.append(abs(gex))
+        else:
+            upper_vals.append(abs(gex))
+
+    lower_sum = sum(lower_vals)
+    upper_sum = sum(upper_vals)
+    total = lower_sum + upper_sum
+
+    if total == 0:
+        return "balanced (no γ)"
+
+    lower_pct = lower_sum / total
+
+    if lower_pct >= 0.60:
+        return f"lower-heavy ({lower_pct*100:.0f}% below midpoint)"
+    elif lower_pct <= 0.40:
+        return f"upper-heavy ({(1-lower_pct)*100:.0f}% above midpoint)"
+    else:
+        return "balanced (≈50/50)"
+
+
 def _describe_delta_trend(diff: float, ref: float) -> str:
     """Convert delta difference into a human-readable trend."""
     if ref == 0:
@@ -437,6 +495,25 @@ def _describe_delta_trend(diff: float, ref: float) -> str:
         return "Delta rising — stronger hedging pressure."
     else:
         return "Delta falling — hedging pressure easing."
+
+
+def _interpret_band_bias(band_bias: str) -> str:
+    """
+    Convert band bias into a trading interpretation.
+    """
+    if not band_bias or band_bias == "—":
+        return "No clear bias — interior gamma evenly distributed."
+
+    txt = band_bias.lower()
+
+    if "lower-heavy" in txt:
+        return "Lower-heavy — stronger dip support; upward microstructure lean."
+    if "upper-heavy" in txt:
+        return "Upper-heavy — drops accelerate; weaker dip support."
+    if "balanced" in txt:
+        return "Balanced — no directional lean; pure wall-to-wall chop."
+
+    return "Band bias unclear."
 
 
 def _build_interpretation(
@@ -560,6 +637,8 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
     near_range, strong_range = _compute_ranges(spot, gex_by_strike, net_gamma)
     top_walls = _top_gamma_walls(gex_by_strike)
     band_walls = _compute_band_walls(strong_range, gex_by_strike)
+    band_bias = _compute_band_bias(strong_range, gex_by_strike)
+    band_bias_interpretation = _interpret_band_bias(band_bias)
 
     # Wide range flag based on Near range width (rounded levels)
     wide_range_flag = ""
@@ -601,6 +680,8 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
         comment=comment,
         top_walls=top_walls,
         band_walls=band_walls,
+        band_bias=band_bias,
+        band_bias_interpretation=band_bias_interpretation,
         delta_trend=delta_trend_short,
         delta_trend_long=delta_trend_long,
         wide_range_flag=wide_range_flag,
@@ -672,6 +753,10 @@ def format_pretty(snapshot: GexSnapshot) -> str:
     lines.append(f"• Walls: {snapshot.top_walls}")
     if snapshot.band_walls and snapshot.band_walls != "—":
         lines.append(f"• Band walls: {snapshot.band_walls}")
+    if snapshot.band_bias and snapshot.band_bias != "—":
+        lines.append(f"• Band bias: {snapshot.band_bias}")
+    if snapshot.band_bias_interpretation and snapshot.band_bias_interpretation != "—":
+        lines.append(f"• Bias note: {snapshot.band_bias_interpretation}")
     lines.append(f"• Δ trend (short): {snapshot.delta_trend}")
     lines.append(f"• Δ trend (1h): {snapshot.delta_trend_long}")
     lines.append(f"• Interpretation: {snapshot.interpretation}")
@@ -695,6 +780,8 @@ def snapshot_to_ultra_row(snapshot: GexSnapshot) -> Dict[str, Any]:
         "comment": snapshot.comment,
         "top_walls": snapshot.top_walls,
         "band_walls": snapshot.band_walls,
+        "band_bias": snapshot.band_bias,
+        "band_bias_interpretation": snapshot.band_bias_interpretation,
         "delta_trend_short": snapshot.delta_trend,
         "delta_trend_long": snapshot.delta_trend_long,
         "wide_range_flag": snapshot.wide_range_flag,
