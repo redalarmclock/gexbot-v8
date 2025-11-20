@@ -305,30 +305,37 @@ def _compute_ranges(spot: float, gex_by_strike: Dict[float, float], net_gamma: f
 def _classify_environment(net_gamma: float) -> Tuple[str, str, str]:
     """
     Classifies the environment based on MAGNITUDE and SIGN of the provided gamma.
-    In this version we pass STRUCTURAL gamma here to define the 'arena'.
+    In this build we pass STRUCTURAL gamma here to define the 'arena'.
+    Thresholds are in USD notional and calibrated for the current BTC/OI regime.
     """
     abs_g = abs(net_gamma)
 
-    if abs_g < 1e2:  # Effectively zero
+    # Thresholds in USD gamma (billions).
+    # These are a good starting point around 90–100k BTC and can be
+    # retuned later (or replaced by percentile-based logic).
+    TH_FLAT = 1_000_000_000.0      # 1B
+    TH_MILD = 12_000_000_000.0     # 12B
+    TH_HIGH = 30_000_000_000.0     # 30B
+
+    if abs_g < TH_FLAT:
         return "flat", "⚪ Flat γ", "Gamma neutral — expect chop."
 
     if net_gamma < 0:
-        if abs_g < 10_000_000:
+        if abs_g < TH_MILD:
             label = "🔴 γ Short (Mild)"
             comment = "Mild neg γ — some whipsaw risk."
-        elif abs_g < 25_000_000:
+        elif abs_g < TH_HIGH:
             label = "🔴 γ Short (Elevated)"
             comment = "Elevated neg γ — expansion and trap risk."
         else:
             label = "🔴 γ Short (Extreme)"
             comment = "Extreme neg γ — large moves, high whipsaw risk."
         return "short", label, comment
-
     else:
-        if abs_g < 10_000_000:
+        if abs_g < TH_MILD:
             label = "🟢 γ Long (Mild)"
             comment = "Mild pos γ — weak mean-revert bias."
-        elif abs_g < 25_000_000:
+        elif abs_g < TH_HIGH:
             label = "🟢 γ Long (Elevated)"
             comment = "Elevated pos γ — strong dampening effect."
         else:
