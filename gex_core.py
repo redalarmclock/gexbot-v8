@@ -15,6 +15,10 @@ DERIBIT_CURRENCY = os.getenv("DERIBIT_CURRENCY", "BTC")
 # Simple risk-free rate assumption (annualised)
 RISK_FREE_RATE = float(os.getenv("RISK_FREE_RATE", "0.05"))
 
+# Minimum Gamma (in USD) required to trigger a directional signal
+# Prevents the bot from flipping bias on noise. 5 Million USD is a conservative floor for BTC.
+GAMMA_SIGNAL_THRESHOLD = 5_000_000.0
+
 
 @dataclass
 class OptionPoint:
@@ -28,7 +32,7 @@ class OptionPoint:
     underlying_price: float
 
     gamma: float          # per 1 option, per 1 underlying unit
-    gamma_exposure: float # dealer-side gamma exposure in underlying units
+    gamma_exposure: float # dealer-side dollar gamma exposure
     delta_exposure: float # dealer-side delta exposure in underlying units
 
 
@@ -38,25 +42,40 @@ class GexSnapshot:
     now_ms: int
     options: List[OptionPoint]
 
-    net_gamma: float             # dealer-side net gamma exposure (underlying units)
-    net_delta: float             # dealer-side net delta exposure (underlying units)
-    magnet: Optional[float]      # gamma-weighted "magnet" level
-    flip: Optional[float]        # level where cumulative gamma changes sign
-    near_range: str              # e.g. "95000R/96000R"
-    strong_range: str            # e.g. "94000R/99000R"
-    gamma_env: str               # "short" / "long" / "flat"
-    gamma_env_label: str         # e.g. "🔴 γ Short"
-    comment: str                 # short environment comment
+    # --- Aggregate Totals (Net Book) ---
+    net_gamma: float             # Total dealer-side gamma (net, all expiries)
+    net_delta: float             # Total dealer-side delta
 
-    top_walls: str               # formatted list of top gamma walls (global)
-    band_walls: str              # formatted list of walls inside strong band
-    band_bias: str               # bias of gamma mass within the strong band
-    band_bias_interpretation: str  # human interpretation of band bias
-    delta_trend: str             # short-term hedging pressure
-    delta_trend_long: str        # ~1h hedging pressure trend
-    wide_range_flag: str         # note when ranges are very wide
-    interpretation: str          # one-liner summary
-    bounce_map: str              # qualitative bounce map from lower band
+    # --- Temporal Segmentation ---
+    gamma_tactical: float        # Gamma expiring ≤ 24h (tactical)
+    gamma_structure: float       # Gamma expiring > 24h (structural)
+    
+    # --- Levels ---
+    magnet: Optional[float]
+    flip: Optional[float]
+    
+    # --- Range Descriptions ---
+    near_range: str
+    strong_range: str
+    
+    # --- Environment & Labels (STRUCTURAL-BASED) ---
+    gamma_env: str               # "short" / "long" / "flat" (based on structural gamma)
+    gamma_env_label: str
+    comment: str
+    
+    # --- High Level Signal ---
+    expiry_outlook: str          # Conflict/confluence between Tactical & Structure
+    
+    # --- Walls & Trends ---
+    top_walls: str
+    band_walls: str
+    band_bias: str
+    band_bias_interpretation: str
+    delta_trend: str
+    delta_trend_long: str
+    wide_range_flag: str
+    interpretation: str
+    bounce_map: str
 
 
 _last_delta: Optional[float] = None
@@ -69,12 +88,16 @@ _delta_history: List[Tuple[int, float]] = []  # (timestamp_ms, net_delta)
 def _get(path: str, params: Dict[str, Any]) -> Any:
     """Thin wrapper around requests.get for Deribit public HTTP API."""
     url = f"{DERIBIT_BASE_URL}/api/v2/{path.lstrip('/')}"
-    resp = requests.get(url, params=params, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    if "result" not in data:
-        raise RuntimeError(f"Unexpected Deribit response for {path}: {data}")
-    return data["result"]
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        if "result" not in data:
+            raise RuntimeError(f"Unexpected Deribit response for {path}: {data}")
+        return data["result"]
+    except Exception as e:
+        # In production, you might want retries here
+        raise RuntimeError(f"API Request Failed: {e}")
 
 
 # ---------- Math helpers ----------
@@ -98,9 +121,7 @@ def _black_scholes_greeks(
 ) -> Tuple[float, float]:
     """
     Return (delta, gamma) for a European option using Black-Scholes.
-    Gamma is the same for calls and puts.
     """
-    # Guard rails for crazy inputs
     if t_years <= 0 or vol <= 0 or spot <= 0 or strike <= 0:
         return 0.0, 0.0
 
@@ -110,7 +131,6 @@ def _black_scholes_greeks(
     gamma = pdf / (spot * vol * sqrt_t)
 
     cdf_d1 = _norm_cdf(d1)
-
     if option_type == "call":
         delta = cdf_d1
     else:  # put
@@ -123,15 +143,6 @@ def _black_scholes_greeks(
 
 
 def fetch_raw_gex_data() -> Dict[str, Any]:
-    """
-    Fetch live BTC options universe + spot from Deribit public HTTP API.
-
-    Returns a dict with:
-      - now_ms
-      - spot
-      - instruments: metadata from public/get_instruments
-      - summaries: book summaries from public/get_book_summary_by_currency
-    """
     now_ms = int(time.time() * 1000)
 
     instruments = _get(
@@ -145,7 +156,6 @@ def fetch_raw_gex_data() -> Dict[str, Any]:
     )
 
     index_result = _get("public/get_index", {"currency": DERIBIT_CURRENCY})
-    # get_index returns {"BTC": price, "edp": price}
     spot = float(index_result.get(DERIBIT_CURRENCY, index_result.get("edp")))
 
     return {
@@ -165,7 +175,6 @@ def _build_option_points(raw: Dict[str, Any]) -> List[OptionPoint]:
     instruments = raw["instruments"]
     summaries = raw["summaries"]
 
-    # Map instrument_name -> meta
     meta_by_name: Dict[str, Dict[str, Any]] = {
         inst["instrument_name"]: inst for inst in instruments
     }
@@ -180,21 +189,17 @@ def _build_option_points(raw: Dict[str, Any]) -> List[OptionPoint]:
 
         strike = float(meta["strike"])
         option_type = "call" if meta.get("option_type", "call") == "call" else "put"
-        expiration_ts = int(meta["expiration_timestamp"])  # ms
+        expiration_ts = int(meta["expiration_timestamp"])
 
         open_interest = float(summ.get("open_interest", 0.0))
         if open_interest <= 0:
-            continue  # ignore dead series
+            continue
 
         mark_iv_pct = float(summ.get("mark_iv", 0.0))
         interest_rate = float(summ.get("interest_rate", RISK_FREE_RATE))
-        underlying_price = float(
-            summ.get("underlying_price", spot)
-        )  # fall back to index
+        underlying_price = float(summ.get("underlying_price", spot))
 
-        # Time to expiry in years
         t_years = max((expiration_ts - now_ms) / (365.0 * 24.0 * 3600.0 * 1000.0), 1e-6)
-
         vol = max(mark_iv_pct / 100.0, 1e-4)
 
         delta, gamma = _black_scholes_greeks(
@@ -206,11 +211,11 @@ def _build_option_points(raw: Dict[str, Any]) -> List[OptionPoint]:
             option_type=option_type,
         )
 
-        # One contract on Deribit BTC options = 1 BTC notional
+        # Note: Deribit BTC options are coin-margined.
+        # Dollar Gamma ≈ gamma * spot^2 * OI
         contract_size = 1.0
-
-        # Customer is assumed long options; dealers short.
-        # So dealer-side exposure is negative of customer greeks.
+        
+        # Dealer is short, customer is long
         customer_gamma_exposure = gamma * (underlying_price ** 2) * open_interest * contract_size
         dealer_gamma_exposure = -customer_gamma_exposure
 
@@ -246,11 +251,9 @@ def _compute_magnet(gex_by_strike: Dict[float, float]) -> Optional[float]:
 
 
 def _compute_flip(gex_by_strike: Dict[float, float]) -> Optional[float]:
-    """Approximate price where cumulative dealer gamma changes sign."""
     if not gex_by_strike:
         return None
-
-    items = sorted(gex_by_strike.items())  # (strike, gex)
+    items = sorted(gex_by_strike.items())
     cum = 0.0
     prev_strike = None
     prev_cum = None
@@ -261,29 +264,19 @@ def _compute_flip(gex_by_strike: Dict[float, float]) -> Optional[float]:
         cum += gex
 
         if prev_cum is not None and (prev_cum == 0 or (prev_cum < 0 < cum) or (prev_cum > 0 > cum)):
-            # Linear interpolation between previous and current strike
             if cum == prev_cum:
                 return strike
             w = abs(prev_cum) / (abs(prev_cum) + abs(cum))
             return prev_strike * (1 - w) + strike * w
-
         prev_strike = strike
-
     return None
 
 
-def _compute_ranges(
-    spot: float,
-    gex_by_strike: Dict[float, float],
-    net_gamma: float,
-) -> Tuple[str, str]:
+def _compute_ranges(spot: float, gex_by_strike: Dict[float, float], net_gamma: float) -> Tuple[str, str]:
     if not gex_by_strike:
         return "—/—", "—/—"
-
-    # Which suffix to use – R for neg gamma (whipsaw), S for pos gamma (supportive)
     suffix = "R" if net_gamma < 0 else "S" if net_gamma > 0 else ""
-
-    items = sorted(gex_by_strike.items())  # (strike, gex)
+    items = sorted(gex_by_strike.items())
     max_abs = max(abs(v) for _, v in items)
     if max_abs == 0:
         return "—/—", "—/—"
@@ -292,39 +285,34 @@ def _compute_ranges(
     strong_threshold = 0.5 * max_abs
 
     def _pick(threshold: float) -> Tuple[Optional[float], Optional[float]]:
-        below_candidates = [
-            (spot - k, k) for k, v in items if k <= spot and abs(v) >= threshold
-        ]
-        above_candidates = [
-            (k - spot, k) for k, v in items if k >= spot and abs(v) >= threshold
-        ]
+        below_candidates = [(spot - k, k) for k, v in items if k <= spot and abs(v) >= threshold]
+        above_candidates = [(k - spot, k) for k, v in items if k >= spot and abs(v) >= threshold]
         below = min(below_candidates)[1] if below_candidates else None
         above = min(above_candidates)[1] if above_candidates else None
         return below, above
-
-    near_below, near_above = _pick(near_threshold)
-    strong_below, strong_above = _pick(strong_threshold)
 
     def _fmt_pair(below: Optional[float], above: Optional[float]) -> str:
         def fmt(x: Optional[float]) -> str:
             if x is None:
                 return "—"
-            rounded = int(round(x / 1000.0) * 1000)  # round to nearest 1k
+            rounded = int(round(x / 1000.0) * 1000)
             return f"{rounded}{suffix}" if suffix else f"{rounded}"
-
         return f"{fmt(below)}/{fmt(above)}"
 
-    return _fmt_pair(near_below, near_above), _fmt_pair(strong_below, strong_above)
+    return _fmt_pair(*_pick(near_threshold)), _fmt_pair(*_pick(strong_threshold))
 
 
 def _classify_environment(net_gamma: float) -> Tuple[str, str, str]:
+    """
+    Classifies the environment based on MAGNITUDE and SIGN of the provided gamma.
+    In this version we pass STRUCTURAL gamma here to define the 'arena'.
+    """
     abs_g = abs(net_gamma)
 
-    # Define meaningful gamma tiers
-    if abs_g < 1e2:
+    if abs_g < 1e2:  # Effectively zero
         return "flat", "⚪ Flat γ", "Gamma neutral — expect chop."
 
-    if net_gamma < 0:  # Short gamma
+    if net_gamma < 0:
         if abs_g < 10_000_000:
             label = "🔴 γ Short (Mild)"
             comment = "Mild neg γ — some whipsaw risk."
@@ -334,10 +322,9 @@ def _classify_environment(net_gamma: float) -> Tuple[str, str, str]:
         else:
             label = "🔴 γ Short (Extreme)"
             comment = "Extreme neg γ — large moves, high whipsaw risk."
-
         return "short", label, comment
 
-    else:  # Long gamma
+    else:
         if abs_g < 10_000_000:
             label = "🟢 γ Long (Mild)"
             comment = "Mild pos γ — weak mean-revert bias."
@@ -347,73 +334,41 @@ def _classify_environment(net_gamma: float) -> Tuple[str, str, str]:
         else:
             label = "🟢 γ Long (Extreme)"
             comment = "Extreme pos γ — strong lean to mean-reversion."
-
         return "long", label, comment
 
 
 def _top_gamma_walls(gex_by_strike: Dict[float, float], top_n: int = 5) -> str:
-    """Return formatted list of top positive/negative gamma walls."""
     if not gex_by_strike:
         return "—"
-
-    # Sort by absolute gamma, descending
-    sorted_walls = sorted(
-        gex_by_strike.items(), key=lambda x: abs(x[1]), reverse=True
-    )[:top_n]
-
+    sorted_walls = sorted(gex_by_strike.items(), key=lambda x: abs(x[1]), reverse=True)[:top_n]
     parts: List[str] = []
     for strike, gex in sorted_walls:
         gex_m = gex / 1_000_000
         direction = "R" if gex < 0 else "S"
         parts.append(f"{int(strike):,} ({gex_m:.2f}M {direction})")
-
     return " | ".join(parts)
 
 
 def _compute_band_walls(strong_range: str, gex_by_strike: Dict[float, float]) -> str:
-    """
-    Return a compressed list of walls *inside* the strong band,
-    sorted by strike ascending, limited to the most relevant few.
-
-    Rules:
-      - Only include walls with |gamma| >= 500M (0.5B).
-      - Show at most the top 4 strongest by |gamma|.
-    """
-    if not gex_by_strike:
+    if not gex_by_strike or strong_range == "—/—":
         return "—"
-    if strong_range == "—/—":
-        return "—"
-
     try:
         low_str, high_str = strong_range.split("/")
         if "—" in low_str or "—" in high_str:
             return "—"
-
-        # Strip trailing R/S if present
-        if low_str.endswith(("R", "S")):
-            low_str = low_str[:-1]
-        if high_str.endswith(("R", "S")):
-            high_str = high_str[:-1]
-
-        low_v = int(low_str)
-        high_v = int(high_str)
+        low_v = int(low_str[:-1] if low_str.endswith(("R", "S")) else low_str)
+        high_v = int(high_str[:-1] if high_str.endswith(("R", "S")) else high_str)
         if low_v > high_v:
             low_v, high_v = high_v, low_v
     except Exception:
         return "—"
 
-    # Select strikes inside the band
     band_items = [(k, v) for k, v in gex_by_strike.items() if low_v <= k <= high_v]
-    if not band_items:
-        return "—"
-
-    # Apply 500M absolute gamma threshold (0.5B)
     threshold = 500_000_000.0
     band_items = [(k, v) for k, v in band_items if abs(v) >= threshold]
     if not band_items:
         return "—"
-
-    # Take the top 4 by |gamma|, then sort by strike ascending
+    
     band_items = sorted(band_items, key=lambda x: abs(x[1]), reverse=True)[:4]
     band_items = sorted(band_items, key=lambda x: x[0])
 
@@ -423,56 +378,30 @@ def _compute_band_walls(strong_range: str, gex_by_strike: Dict[float, float]) ->
         direction = "R" if gex < 0 else "S"
         gex_m = abs(gex) / 1_000_000.0
         parts.append(f"{strike_k}k{direction} ({gex_m:.1f}M)")
-
     return " | ".join(parts)
 
 
 def _compute_band_bias(strong_range: str, gex_by_strike: Dict[float, float]) -> str:
-    """
-    Compute whether the strong band is lower-heavy, upper-heavy, or balanced.
-    Uses absolute gamma exposure inside the band.
-    """
     if not gex_by_strike or strong_range == "—/—":
         return "—"
-
     try:
         low_str, high_str = strong_range.split("/")
         if "—" in low_str or "—" in high_str:
             return "—"
-
-        # Remove R/S
-        if low_str.endswith(("R", "S")):
-            low_str = low_str[:-1]
-        if high_str.endswith(("R", "S")):
-            high_str = high_str[:-1]
-
-        low_v = int(low_str)
-        high_v = int(high_str)
+        low_v = int(low_str[:-1] if low_str.endswith(("R", "S")) else low_str)
+        high_v = int(high_str[:-1] if high_str.endswith(("R", "S")) else high_str)
         if low_v > high_v:
             low_v, high_v = high_v, low_v
     except Exception:
         return "—"
 
     mid = (low_v + high_v) / 2.0
-
-    lower_vals: List[float] = []
-    upper_vals: List[float] = []
-
-    for strike, gex in gex_by_strike.items():
-        if strike < low_v or strike > high_v:
-            continue
-        if strike <= mid:
-            lower_vals.append(abs(gex))
-        else:
-            upper_vals.append(abs(gex))
-
-    lower_sum = sum(lower_vals)
-    upper_sum = sum(upper_vals)
+    lower_sum = sum(abs(v) for k, v in gex_by_strike.items() if low_v <= k <= mid)
+    upper_sum = sum(abs(v) for k, v in gex_by_strike.items() if mid < k <= high_v)
     total = lower_sum + upper_sum
 
     if total == 0:
         return "balanced (no γ)"
-
     lower_pct = lower_sum / total
 
     if lower_pct >= 0.60:
@@ -484,12 +413,9 @@ def _compute_band_bias(strong_range: str, gex_by_strike: Dict[float, float]) -> 
 
 
 def _describe_delta_trend(diff: float, ref: float) -> str:
-    """Convert delta difference into a human-readable trend."""
     if ref == 0:
         ref = 1.0
     rel = abs(diff) / abs(ref)
-
-    # Small absolute + small relative move -> stable
     if abs(diff) < 1000 and rel < 0.03:
         return "Delta stable — hedging unchanged."
     elif diff > 0:
@@ -499,110 +425,72 @@ def _describe_delta_trend(diff: float, ref: float) -> str:
 
 
 def _interpret_band_bias(band_bias: str) -> str:
-    """
-    Convert band bias into a trading interpretation.
-    """
     if not band_bias or band_bias == "—":
         return "No clear bias — interior gamma evenly distributed."
-
     txt = band_bias.lower()
-
     if "lower-heavy" in txt:
         return "Lower-heavy — stronger dip support; upward microstructure lean."
     if "upper-heavy" in txt:
         return "Upper-heavy — drops accelerate; weaker dip support."
     if "balanced" in txt:
         return "Balanced — no directional lean; pure wall-to-wall chop."
-
     return "Band bias unclear."
 
 
 def _fmt_k_level(price: float) -> str:
-    """
-    Format a price like 90540 as '90.5k', 90000 as '90k'.
-    """
     if price <= 0 or math.isnan(price):
         return "—"
-    rounded = round(price / 100.0) * 100  # nearest 100
+    rounded = round(price / 100.0) * 100
     k = rounded / 1000.0
-    if abs(rounded % 1000) < 1e-6:
-        return f"{k:.0f}k"
-    else:
-        return f"{k:.1f}k"
+    return f"{k:.0f}k" if abs(rounded % 1000) < 1e-6 else f"{k:.1f}k"
 
 
 def _compute_bounce_map(
     spot: float,
     strong_range: str,
     gamma_env: str,
-    net_gamma: float,
+    struct_gamma: float,
     net_delta: float,
 ) -> str:
     """
-    Build a qualitative 'bounce map' from the lower strong-band wall.
-
-    Stateless, but stage-aware based on *current spot*:
-      - If spot <= tag   → tag not done
-      - If spot > tag    → tag marked 'done'
-      - If spot > rebound / extension / mid → those are marked 'in play' or 'done'
+    Bounce map anchored on the lower strong band.
+    Uses STRUCTURAL gamma for magnitude and only shows in short-γ environments.
+    Wording uses 'zones' and 'tested/engaged/likely completed' to avoid implying exact ticks.
     """
-    # Only meaningful in short-gamma regimes with a valid band
     if gamma_env != "short" or not strong_range or strong_range == "—/—":
         return "Map only shown in short-γ with defined strong band."
-
+    
     try:
         low_str, high_str = strong_range.split("/")
         if "—" in low_str or "—" in high_str:
-            return "Map only shown in short-γ with defined strong band."
-
-        # Strip trailing R/S if present
-        if low_str.endswith(("R", "S")):
-            low_str = low_str[:-1]
-        if high_str.endswith(("R", "S")):
-            high_str = high_str[:-1]
-
-        low_v = int(low_str)
-        high_v = int(high_str)
+            return "Map unavailable."
+        low_v = int(low_str[:-1] if low_str.endswith(("R", "S")) else low_str)
+        high_v = int(high_str[:-1] if high_str.endswith(("R", "S")) else high_str)
         if low_v > high_v:
             low_v, high_v = high_v, low_v
     except Exception:
-        return "Map unavailable (bad band)."
+        return "Map unavailable."
 
-    # Only show if spot is at least in the vicinity of the band
     if spot < low_v - 2_000 or spot > high_v + 2_000:
-        return "Map focuses on reactions from the lower band; spot currently far from band."
+        return "Map focuses on reactions from the lower band; spot currently far from that zone."
 
-    abs_gamma = abs(net_gamma)
+    abs_gamma = abs(struct_gamma)
     abs_delta = abs(net_delta)
-
-    # Define tiers based on magnitude
     extreme_gamma = abs_gamma >= 25_000_000
     strong_delta = abs_delta >= 40_000
-    very_strong_delta = abs_delta >= 55_000
 
-    # Key ladder levels from the lower band edge
     lvl_tag = low_v
-    lvl_rebound = low_v * 1.006   # ~0.6% bounce
-    lvl_extend = low_v * 1.014   # ~1.4% extension
+    lvl_rebound = low_v * 1.006
+    lvl_extend = low_v * 1.014
     lvl_mid = (low_v + high_v) / 2.0
 
-    # Baseline qualitative odds (used when a level is not yet "done" / "in play")
     tag_prob = "very likely"
-    if extreme_gamma and very_strong_delta:
-        rebound_prob = "high"
-        extend_prob = "medium"
-        mid_prob = "low"
-    elif extreme_gamma and strong_delta:
-        rebound_prob = "high"
-        extend_prob = "medium"
-        mid_prob = "low"
+    if extreme_gamma and strong_delta:
+        rebound_prob, extend_prob, mid_prob = "high", "medium", "low"
     else:
-        rebound_prob = "medium"
-        extend_prob = "low"
-        mid_prob = "low"
+        rebound_prob, extend_prob, mid_prob = "medium", "low", "low"
 
-    # Stateless "stage" from current spot location
-    # 0: ≤ tag, 1: >tag, 2: >rebound, 3: >extension, 4: >mid
+    # Stage ladder based on spot vs static zones
     stage = 0
     if spot > lvl_tag:
         stage = 1
@@ -613,35 +501,31 @@ def _compute_bounce_map(
     if spot > lvl_mid:
         stage = 4
 
-    # --- Build labels with stage awareness ---
-
-    # Tag: either still probabilistic, or already effectively done
+    # Soften wording: zones + tested/engaged/likely completed
     if stage == 0:
-        tag_desc = f"{_fmt_k_level(lvl_tag)} tag — {tag_prob}"
+        tag_desc = f"{_fmt_k_level(lvl_tag)} tag zone — {tag_prob}"
     else:
-        tag_desc = f"{_fmt_k_level(lvl_tag)} tag — done"
+        tag_desc = f"{_fmt_k_level(lvl_tag)} tag zone — tested"
 
-    # Rebound: probability until crossed; then "in play" or "done"
     if stage <= 1:
-        rebound_desc = f"{_fmt_k_level(lvl_rebound)} rebound — {rebound_prob}"
+        rebound_desc = f"{_fmt_k_level(lvl_rebound)} rebound zone — {rebound_prob}"
     elif stage == 2:
-        rebound_desc = f"{_fmt_k_level(lvl_rebound)} rebound — in play"
+        rebound_desc = f"{_fmt_k_level(lvl_rebound)} rebound zone — engaged"
     else:
-        rebound_desc = f"{_fmt_k_level(lvl_rebound)} rebound — done"
+        rebound_desc = f"{_fmt_k_level(lvl_rebound)} rebound zone — likely completed"
 
-    # Extension: probability until crossed; then "in play" or "done"
     if stage <= 2:
-        extend_desc = f"{_fmt_k_level(lvl_extend)} extension — {extend_prob}"
+        extend_desc = f"{_fmt_k_level(lvl_extend)} extension zone — {extend_prob}"
     elif stage == 3:
-        extend_desc = f"{_fmt_k_level(lvl_extend)} extension — in play"
+        extend_desc = f"{_fmt_k_level(lvl_extend)} extension zone — engaged"
     else:
-        extend_desc = f"{_fmt_k_level(lvl_extend)} extension — done"
+        extend_desc = f"{_fmt_k_level(lvl_extend)} extension zone — likely completed"
 
-    # Mid / stretch: probability until we're beyond mid; then "in play"
-    if stage < 4:
-        mid_desc = f"{_fmt_k_level(lvl_mid)} stretch — {mid_prob}"
-    else:
-        mid_desc = f"{_fmt_k_level(lvl_mid)} stretch — in play"
+    mid_desc = (
+        f"{_fmt_k_level(lvl_mid)} stretch zone — in play"
+        if stage >= 4
+        else f"{_fmt_k_level(lvl_mid)} stretch zone — {mid_prob}"
+    )
 
     return f"{tag_desc} → {rebound_desc} → {extend_desc} → {mid_desc}"
 
@@ -653,19 +537,15 @@ def _build_interpretation(
     top_walls: str,
     wide_range_flag: str,
 ) -> str:
-    """Generate a one-liner summary from walls + environment."""
     if not top_walls or top_walls == "—":
         return "No dominant walls — GEX structure light; behaviour driven more by flows than walls."
 
-    # Primary wall: first entry in top_walls
     primary = top_walls.split(" | ")[0]
     strike_label = "key level"
     direction = ""
-
     try:
-        strike_str, _rest = primary.split(" ", 1)
-        strike_clean = strike_str.replace(",", "")
-        strike_val = int(strike_clean)
+        strike_str, _ = primary.split(" ", 1)
+        strike_val = int(strike_str.replace(",", ""))
         strike_label = f"{strike_val // 1000}k"
         if " R)" in primary:
             direction = "R"
@@ -674,47 +554,32 @@ def _build_interpretation(
     except Exception:
         pass
 
-    # Derive band from near_range
-    band = ""
-    try:
-        low_str, high_str = near_range.split("/")
-        if "—" not in low_str and "—" not in high_str:
-            low_clean = low_str[:-1] if low_str.endswith(("R", "S")) else low_str
-            high_clean = high_str[:-1] if high_str.endswith(("R", "S")) else high_str
-            low_v = int(low_clean)
-            high_v = int(high_clean)
-            band = f"{low_v // 1000}–{high_v // 1000}k"
-    except Exception:
-        band = ""
-
-    # Behaviour based on gamma environment + width
+    behaviour = "choppy, transition-type price action."
     if gamma_env == "short":
-        if wide_range_flag:
-            behaviour = "wide negative-gamma chop with sharp moves across the zone."
-        else:
-            behaviour = "negative-gamma chop with potential sharp squeezes."
+        behaviour = (
+            "wide negative-gamma chop with sharp moves."
+            if wide_range_flag
+            else "negative-gamma chop with potential sharp squeezes."
+        )
     elif gamma_env == "long":
         behaviour = "mean-reversion towards the magnet with dampened swings."
-    else:
-        behaviour = "choppy, transition-type price action."
 
-    # Direction label
-    if direction == "R":
-        wall_desc = "major R wall"
-    elif direction == "S":
-        wall_desc = "major S wall"
-    else:
-        wall_desc = "major wall"
+    wall_desc = (
+        "major R wall" if direction == "R"
+        else "major S wall" if direction == "S"
+        else "major wall"
+    )
+    return f"{wall_desc} at {strike_label} — expect {behaviour}"
 
-    if band:
-        return f"{wall_desc} at {strike_label} with nearby walls across {band} — expect {behaviour}"
-    else:
-        return f"{wall_desc} at {strike_label} — expect {behaviour}"
+
+def _get_regime_sign(gamma_val: float, threshold: float = GAMMA_SIGNAL_THRESHOLD) -> int:
+    """Helper to clamp small gamma values to 0 to avoid signal noise."""
+    if abs(gamma_val) < threshold:
+        return 0
+    return 1 if gamma_val > 0 else -1
 
 
 def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
-    """Turn raw Deribit data into a single GEX snapshot."""
-
     global _last_delta, _delta_history
 
     spot = float(raw["spot"])
@@ -724,13 +589,22 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
     if not options:
         raise RuntimeError("No active BTC options with open interest returned from Deribit")
 
-    # Aggregate gamma / delta
+    # 1. Base Aggregations (Net Book)
     net_gamma = sum(p.gamma_exposure for p in options)
     net_delta = sum(p.delta_exposure for p in options)
 
-    # ---------- Delta trends ----------
+    # 2. Temporal Segmentation (≤24h vs >24h)
+    ONE_DAY_MS = 24 * 60 * 60 * 1000
+    cutoff_ts = now_ms + ONE_DAY_MS
 
-    # Short-term: compare to previous snapshot
+    gamma_tactical = sum(
+        p.gamma_exposure for p in options if p.expiration_timestamp <= cutoff_ts
+    )
+    gamma_structure = sum(
+        p.gamma_exposure for p in options if p.expiration_timestamp > cutoff_ts
+    )
+
+    # 3. Delta Trends
     if _last_delta is None:
         delta_trend_short = "Δ baseline — first sample."
     else:
@@ -738,16 +612,12 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
         delta_trend_short = _describe_delta_trend(diff_short, _last_delta)
     _last_delta = net_delta
 
-    # Update history for long-term trend (~1h)
     _delta_history.append((now_ms, net_delta))
-    # prune older than 2h
-    cutoff = now_ms - 2 * 3600_000
-    _delta_history = [(t, d) for (t, d) in _delta_history if t >= cutoff]
+    cutoff_hist = now_ms - 2 * 3600_000
+    _delta_history = [(t, d) for (t, d) in _delta_history if t >= cutoff_hist]
 
-    # Find reference ~1h ago (closest entry at or before now - 1h)
     target = now_ms - 3600_000
     past_candidates = [(t, d) for (t, d) in _delta_history if t <= target]
-
     if not past_candidates:
         delta_trend_long = "Δ (1h) baseline — insufficient history."
     else:
@@ -755,37 +625,49 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
         diff_long = net_delta - ref_delta
         delta_trend_long = _describe_delta_trend(diff_long, ref_delta)
 
-    # ---------- Gamma / walls / ranges ----------
-
+    # 4. Ranges & Walls (still use net gamma to decide R/S labels)
     gex_by_strike: Dict[float, float] = {}
     for p in options:
         gex_by_strike[p.strike] = gex_by_strike.get(p.strike, 0.0) + p.gamma_exposure
 
     magnet = _compute_magnet(gex_by_strike)
     flip = _compute_flip(gex_by_strike)
-
     near_range, strong_range = _compute_ranges(spot, gex_by_strike, net_gamma)
     top_walls = _top_gamma_walls(gex_by_strike)
     band_walls = _compute_band_walls(strong_range, gex_by_strike)
     band_bias = _compute_band_bias(strong_range, gex_by_strike)
     band_bias_interpretation = _interpret_band_bias(band_bias)
 
-    # Wide range flag based on Near range width (rounded levels)
     wide_range_flag = ""
     try:
         low_str, high_str = near_range.split("/")
         if "—" not in low_str and "—" not in high_str:
-            # Strip suffix R/S if present
-            low_clean = low_str[:-1] if low_str.endswith(("R", "S")) else low_str
-            high_clean = high_str[:-1] if high_str.endswith(("R", "S")) else high_str
-            low_v = int(low_clean)
-            high_v = int(high_clean)
+            low_v = int(low_str[:-1] if low_str.endswith(("R", "S")) else low_str)
+            high_v = int(high_str[:-1] if high_str.endswith(("R", "S")) else high_str)
             if abs(high_v - low_v) >= 4_000:
                 wide_range_flag = "Wide chop zone — dispersed walls."
     except Exception:
-        wide_range_flag = ""
+        pass
 
-    gamma_env, gamma_env_label, comment = _classify_environment(net_gamma)
+    # 5. Environment Classification (STRUCTURAL)
+    gamma_env, gamma_env_label, comment = _classify_environment(gamma_structure)
+
+    # 6. Expiry Outlook (Hybrid Signal with Thresholding)
+    s_sign = _get_regime_sign(gamma_structure)
+    t_sign = _get_regime_sign(gamma_tactical)
+
+    expiry_outlook = "Balanced / Weak Signal"  # Default
+
+    if s_sign == 1 and t_sign == -1:
+        expiry_outlook = "⚠️ Volatility within Support (Dip-Buy)"
+    elif s_sign == -1 and t_sign == -1:
+        expiry_outlook = "🚨 DANGER: Structural + Tactical Instability"
+    elif s_sign == -1 and t_sign == 1:
+        expiry_outlook = "🛑 Tactical Pinning (Structural Breakout Risk)"
+    elif s_sign == 1 and t_sign == 1:
+        expiry_outlook = "✅ Full Spectrum Stability"
+    elif s_sign == 0 and t_sign != 0:
+        expiry_outlook = f"Tactical Flow Dominant ({'Long' if t_sign > 0 else 'Short'})"
 
     interpretation = _build_interpretation(
         spot=spot,
@@ -794,12 +676,11 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
         top_walls=top_walls,
         wide_range_flag=wide_range_flag,
     )
-
     bounce_map = _compute_bounce_map(
         spot=spot,
         strong_range=strong_range,
         gamma_env=gamma_env,
-        net_gamma=net_gamma,
+        struct_gamma=gamma_structure,
         net_delta=net_delta,
     )
 
@@ -809,6 +690,9 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
         options=options,
         net_gamma=net_gamma,
         net_delta=net_delta,
+        gamma_tactical=gamma_tactical,
+        gamma_structure=gamma_structure,
+        expiry_outlook=expiry_outlook,
         magnet=magnet,
         flip=flip,
         near_range=near_range,
@@ -828,7 +712,7 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
     )
 
 
-# ---------- Formatting helpers for bot & history ----------
+# ---------- Formatting helpers ----------
 
 
 def _fmt_price(p: Optional[float]) -> str:
@@ -838,24 +722,24 @@ def _fmt_price(p: Optional[float]) -> str:
 
 
 def format_ultra(snapshot: GexSnapshot) -> str:
-    """One-liner style print for the fast 'ultra' feed."""
+    """
+    Ultra-short print for the main feed.
+    Keeps Environment, Spot, Magnet, Δ and Γ on the first line, plus a lightweight alert tag.
+    """
     spot_s = _fmt_price(snapshot.spot)
-
-    # Flip suppression logic: hide if too far from spot (>25%)
-    if snapshot.flip is not None and abs(snapshot.flip - snapshot.spot) / snapshot.spot <= 0.25:
-        flip_s = _fmt_price(snapshot.flip)
-    else:
-        flip_s = "—"
-
     mag_s = _fmt_price(snapshot.magnet)
-
     delta_s = f"{snapshot.net_delta:,.0f}"
     gamma_m = snapshot.net_gamma / 1_000_000.0
-    gamma_s = f"{gamma_m:.2f}M"
+
+    alert = ""
+    if "DANGER" in snapshot.expiry_outlook:
+        alert = " 🚨"
+    elif "Volatility" in snapshot.expiry_outlook:
+        alert = " ⚠️"
 
     line1 = (
-        f"{DERIBIT_CURRENCY} {spot_s} | {snapshot.gamma_env_label} <~{flip_s} | "
-        f"🎯 Mag {mag_s} | Δ {delta_s} | Γ {gamma_s}"
+        f"{DERIBIT_CURRENCY} {spot_s} | {snapshot.gamma_env_label}{alert} "
+        f"| 🎯 Mag {mag_s} | Δ {delta_s} | Γ {gamma_m:+.2f}M"
     )
     line2 = f"📊 Near {snapshot.near_range} | Strong {snapshot.strong_range}"
     return f"{line1}\n{line2}"
@@ -864,48 +748,50 @@ def format_ultra(snapshot: GexSnapshot) -> str:
 def format_pretty(snapshot: GexSnapshot) -> str:
     """More verbose block for the 'pretty' 15m feed."""
     spot_s = _fmt_price(snapshot.spot)
-
-    # Flip suppression logic: hide if too far from spot (>25%)
-    if snapshot.flip is not None and abs(snapshot.flip - snapshot.spot) / snapshot.spot <= 0.25:
-        flip_s = _fmt_price(snapshot.flip)
-    else:
-        flip_s = "—"
-
+    flip_s = (
+        _fmt_price(snapshot.flip)
+        if snapshot.flip and abs(snapshot.flip - snapshot.spot) / snapshot.spot <= 0.25
+        else "—"
+    )
     mag_s = _fmt_price(snapshot.magnet)
-
     delta_s = f"{snapshot.net_delta:,.0f}"
     gamma_m = snapshot.net_gamma / 1_000_000.0
-    gamma_s = f"{gamma_m:.2f}M"
+    
+    gt_m = snapshot.gamma_tactical / 1_000_000.0
+    gs_m = snapshot.gamma_structure / 1_000_000.0
 
     lines: List[str] = [
         f"📊 {DERIBIT_CURRENCY} GEX Update | Spot {spot_s}",
         "",
-        f"• Environment: {snapshot.gamma_env_label} – {snapshot.comment}",
+        f"• Environment: {snapshot.gamma_env_label}",
+        f"• Signal: {snapshot.expiry_outlook}",
+        "",
+        f"• Structure Γ: {gs_m:+.1f}M (Book)",
+        f"• Tactical Γ:  {gt_m:+.1f}M (≤24h)",
+        "",
         f"• Magnet: {mag_s}  | Flip: {flip_s}",
-        f"• Net Γ: {gamma_s} | Δ: {delta_s}",
+        f"• Net Γ: {gamma_m:.1f}M | Δ: {delta_s}",
         f"• Near: {snapshot.near_range} | Strong: {snapshot.strong_range}",
     ]
 
     if snapshot.wide_range_flag:
         lines.append(f"• Range note: {snapshot.wide_range_flag}")
-
     lines.append(f"• Walls: {snapshot.top_walls}")
+    
     if snapshot.band_walls and snapshot.band_walls != "—":
         lines.append(f"• Band walls: {snapshot.band_walls}")
-        # Band bias + optional note
+    
     if snapshot.band_bias and snapshot.band_bias != "—":
         lines.append(f"• Band bias: {snapshot.band_bias}")
-
-        # Only show bias note when band is not balanced; otherwise it adds noise.
         if (
             snapshot.band_bias_interpretation
-            and snapshot.band_bias_interpretation != "—"
             and "balanced" not in snapshot.band_bias.lower()
         ):
             lines.append(f"• Bias note: {snapshot.band_bias_interpretation}")
 
     if snapshot.bounce_map and snapshot.bounce_map != "—":
         lines.append(f"• Bounce map: {snapshot.bounce_map}")
+        
     lines.append(f"• Δ trend (short): {snapshot.delta_trend}")
     lines.append(f"• Δ trend (1h): {snapshot.delta_trend_long}")
     lines.append(f"• Interpretation: {snapshot.interpretation}")
@@ -914,12 +800,14 @@ def format_pretty(snapshot: GexSnapshot) -> str:
 
 
 def snapshot_to_ultra_row(snapshot: GexSnapshot) -> Dict[str, Any]:
-    """Row schema for the 5-minute 'ultra' history log."""
     return {
         "timestamp": snapshot.now_ms,
         "spot": snapshot.spot,
         "gamma_env": snapshot.gamma_env,
         "gamma_env_label": snapshot.gamma_env_label,
+        "expiry_outlook": snapshot.expiry_outlook,
+        "gamma_tactical": snapshot.gamma_tactical,
+        "gamma_structure": snapshot.gamma_structure,
         "flip": snapshot.flip,
         "magnet": snapshot.magnet,
         "delta": snapshot.net_delta,
@@ -940,6 +828,5 @@ def snapshot_to_ultra_row(snapshot: GexSnapshot) -> Dict[str, Any]:
 
 
 def snapshot_to_pretty_row(snapshot: GexSnapshot) -> Dict[str, Any]:
-    """Row schema for the 15-minute 'pretty' history log."""
-    # Same fields for now; you can diverge later if needed.
+    # For now pretty == ultra in saved row; formatting differences are in the printers.
     return snapshot_to_ultra_row(snapshot)
