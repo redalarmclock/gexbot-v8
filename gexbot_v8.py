@@ -39,8 +39,10 @@ def compute_directional_bias(history_window: Deque[GexSnapshot], current: GexSna
     deltas = [s.net_delta for s in window]
     gammas = [s.net_gamma for s in window]
 
-    # Thresholds
-    delta_trend = _trend_label(deltas, eps_abs=500.0) 
+    # --- NOISE FILTER: 800.0 (Was 500.0) ---
+    # This filters out small chop signals during high-volatility regimes
+    delta_trend = _trend_label(deltas, eps_abs=800.0) 
+    
     gamma_trend = _trend_label(gammas, eps_abs=1_000_000_000.0)
 
     env = current.gamma_env 
@@ -83,7 +85,7 @@ def compute_directional_bias(history_window: Deque[GexSnapshot], current: GexSna
     if gamma_trend == "down": risk_suffix = " | ⚠️ Risk: Rising"
     elif gamma_trend == "up": risk_suffix = " | 🧊 Risk: Fading"
 
-    return f"{emoji} Flow: {bias}{risk_suffix} -> {desc}"
+    return f"{emoji} Flow: {bias}{risk_suffix}\n   👉 {desc}"
 
 # --- Jobs ---
 
@@ -113,9 +115,9 @@ def pretty_job() -> None:
         final_text = f"{base_text}\n\n{flow_line}"
         send_message(final_text)
         
-        # --- NEW: Inject Flow into the Log ---
+        # Inject Flow into log
         row_data = snapshot_to_pretty_row(snapshot)
-        row_data['flow_bias'] = flow_line  # Add the calculated flow text
+        row_data['flow_bias'] = flow_line
         
         log_pretty(row_data)
         print("[PRETTY] Sent + Logged")
