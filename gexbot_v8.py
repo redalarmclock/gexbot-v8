@@ -6,6 +6,8 @@ from typing import Deque, List
 
 from config import ULTRA_INTERVAL_MIN, PRETTY_INTERVAL_MIN
 from telegram_utils import send_message
+
+# We import the correct class and functions from your CURRENT gex_core
 from gex_core import (
     fetch_raw_gex_data, 
     compute_gex_snapshot, 
@@ -15,6 +17,7 @@ from gex_core import (
     snapshot_to_ultra_row,
     snapshot_to_pretty_row
 )
+# Re-enable logging (ensure sheets_utils is fixed first)
 from history_bot import log_ultra, log_pretty 
 
 # --- History Buffer ---
@@ -47,6 +50,7 @@ def compute_directional_bias(history_window: Deque[GexSnapshot], current: GexSna
     window = list(history_window)[-3:]
 
     # extracting metrics using YOUR current gex_core variable names
+    # (net_delta, net_gamma are the correct fields in your God Mode file)
     deltas = [s.net_delta for s in window]
     gammas = [s.net_gamma for s in window]
 
@@ -56,7 +60,7 @@ def compute_directional_bias(history_window: Deque[GexSnapshot], current: GexSna
     # 1 Billion USD Gamma change is significant structure change
     gamma_trend = _trend_label(gammas, eps_abs=1_000_000_000.0)
 
-    # Get Environment (short/long) from your existing field
+    # Get Environment (short/long) from your existing field 'gamma_env'
     env = current.gamma_env 
 
     bias = "Neutral"
@@ -97,6 +101,7 @@ def compute_directional_bias(history_window: Deque[GexSnapshot], current: GexSna
             emoji = "📎"
 
     else:
+        # Neutral / Flat environment
         bias = "Flow-Driven"
         desc = "Spot & Perp flows dominate (GEX Neutral)."
         emoji = "🎲"
@@ -118,7 +123,7 @@ def ultra_job() -> None:
         snapshot = compute_gex_snapshot(raw)
         history.append(snapshot)
         
-        # Ultra doesn't strictly need the bias line, but we send it
+        # Ultra doesn't strictly need the bias line, but we send it standard
         text = format_ultra(snapshot)
         send_message(text)
         
@@ -136,7 +141,7 @@ def pretty_job() -> None:
 
         base_text = format_pretty(snapshot)
         
-        # Calculate the new Directional Bias
+        # Calculate the new Directional Bias (Flow Line)
         flow_line = compute_directional_bias(history, snapshot)
         
         final_text = f"{base_text}\n\n{flow_line}"
