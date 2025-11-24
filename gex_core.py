@@ -70,6 +70,7 @@ class GexSnapshot:
     band_walls: str
     band_bias: str
     band_bias_interpretation: str
+    intraday_structure: str      # <--- NEW FIELD: Micro-structure for scalping
     delta_trend: str
     delta_trend_long: str
     wide_range_flag: str
@@ -209,8 +210,6 @@ def _build_option_points(raw: Dict[str, Any]) -> List[OptionPoint]:
             option_type=option_type,
         )
 
-        # Note: Deribit BTC options are coin-margined.
-        # Dollar Gamma approx gamma * spot^2 * OI
         contract_size = 1.0
         
         # Dealer is short, customer is long
@@ -279,7 +278,6 @@ def _compute_ranges(spot: float, gex_by_strike: Dict[float, float], net_gamma: f
     if max_abs == 0:
         return "—/—", "—/—"
 
-    # --- 10% TWEAK APPLIED HERE ---
     near_threshold = 0.10 * max_abs 
     strong_threshold = 0.5 * max_abs
 
@@ -302,16 +300,10 @@ def _compute_ranges(spot: float, gex_by_strike: Dict[float, float], net_gamma: f
 
 
 def _classify_environment(net_gamma: float) -> Tuple[str, str, str]:
-    """
-    Classifies the environment based on MAGNITUDE and SIGN.
-    Using Billions thresholds for current high-vol regime.
-    """
     abs_g = abs(net_gamma)
-
-    # Thresholds in USD gamma (billions).
-    TH_FLAT = 1_000_000_000.0      # 1B
-    TH_MILD = 12_000_000_000.0     # 12B
-    TH_HIGH = 30_000_000_000.0     # 30B
+    TH_FLAT = 1_000_000_000.0
+    TH_MILD = 12_000_000_000.0
+    TH_HIGH = 30_000_000_000.0
 
     if abs_g < TH_FLAT:
         return "flat", "⚪ Flat γ", "Gamma neutral — expect chop."
@@ -382,6 +374,47 @@ def _compute_band_walls(strong_range: str, gex_by_strike: Dict[float, float]) ->
         gex_m = abs(gex) / 1_000_000.0
         parts.append(f"{strike_k}k{direction} ({gex_m:.1f}M)")
     return " | ".join(parts)
+
+
+def _compute_intraday_structure(spot: float, gex_by_strike: Dict[float, float]) -> str:
+    """
+    Identifies 'Micro-Structures' within 1.5% of spot.
+    Threshold: 50M USD (10x smaller than Macro Walls).
+    """
+    range_pct = 0.015 # 1.5%
+    low_bound = spot * (1 - range_pct)
+    high_bound = spot * (1 + range_pct)
+    
+    local_items = [
+        (k, v) for k, v in gex_by_strike.items() 
+        if low_bound <= k <= high_bound
+    ]
+    
+    # 50M Threshold for Intraday sensitivity
+    threshold = 50_000_000.0
+    significant_items = [(k, v) for k, v in local_items if abs(v) >= threshold]
+    
+    # Sort by Strike (Price path)
+    significant_items.sort(key=lambda x: x[0])
+    
+    if not significant_items:
+        return "— (Vacuum)"
+        
+    parts = []
+    for strike, gex in significant_items:
+        # Format: 86.5k or 86k
+        k_val = strike / 1000.0
+        if k_val.is_integer():
+             k_str = f"{int(k_val)}k"
+        else:
+             k_str = f"{k_val:.1f}k"
+             
+        direction = "R" if gex < 0 else "S"
+        gex_m = abs(gex) / 1_000_000.0
+        
+        parts.append(f"{k_str}{direction} ({gex_m:.0f}M)")
+        
+    return " → ".join(parts)
 
 
 def _compute_band_bias(strong_range: str, gex_by_strike: Dict[float, float]) -> str:
@@ -629,6 +662,9 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
     band_walls = _compute_band_walls(strong_range, gex_by_strike)
     band_bias = _compute_band_bias(strong_range, gex_by_strike)
     band_bias_interpretation = _interpret_band_bias(band_bias)
+    
+    # NEW: Intraday Structure
+    intraday_structure = _compute_intraday_structure(spot, gex_by_strike)
 
     wide_range_flag = ""
     try:
@@ -694,6 +730,7 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
         band_walls=band_walls,
         band_bias=band_bias,
         band_bias_interpretation=band_bias_interpretation,
+        intraday_structure=intraday_structure, # NEW
         delta_trend=delta_trend_short,
         delta_trend_long=delta_trend_long,
         wide_range_flag=wide_range_flag,
@@ -770,6 +807,10 @@ def format_pretty(snapshot: GexSnapshot) -> str:
     if snapshot.band_walls and snapshot.band_walls != "—":
         lines.append(f"• Band walls: {snapshot.band_walls}")
     
+    # NEW: Intraday Structure
+    if snapshot.intraday_structure and snapshot.intraday_structure != "— (Vacuum)":
+        lines.append(f"• 🔬 Intraday: {snapshot.intraday_structure}")
+    
     if snapshot.band_bias and snapshot.band_bias != "—":
         lines.append(f"• Band bias: {snapshot.band_bias}")
         if (
@@ -808,6 +849,7 @@ def snapshot_to_ultra_row(snapshot: GexSnapshot) -> Dict[str, Any]:
         "band_walls": snapshot.band_walls,
         "band_bias": snapshot.band_bias,
         "band_bias_interpretation": snapshot.band_bias_interpretation,
+        "intraday_structure": snapshot.intraday_structure, # NEW
         "delta_trend_short": snapshot.delta_trend,
         "delta_trend_long": snapshot.delta_trend_long,
         "wide_range_flag": snapshot.wide_range_flag,
@@ -817,5 +859,4 @@ def snapshot_to_ultra_row(snapshot: GexSnapshot) -> Dict[str, Any]:
 
 
 def snapshot_to_pretty_row(snapshot: GexSnapshot) -> Dict[str, Any]:
-    # We return the same struct; gexbot_v8 adds the 'flow_bias' field manually
     return snapshot_to_ultra_row(snapshot)
