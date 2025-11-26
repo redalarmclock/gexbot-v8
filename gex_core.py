@@ -88,8 +88,14 @@ _delta_history: List[Tuple[int, float]] = []  # (timestamp_ms, net_delta)
 def _get(path: str, params: Dict[str, Any]) -> Any:
     """Thin wrapper around requests.get for Deribit public HTTP API."""
     url = f"{DERIBIT_BASE_URL}/api/v2/{path.lstrip('/')}"
+    
+    # Added User-Agent to prevent Cloudflare/Railway blocks
+    headers = {
+        "User-Agent": "GexBot/8.3 (Railway; +https://github.com/yourusername)"
+    }
+    
     try:
-        resp = requests.get(url, params=params, timeout=10)
+        resp = requests.get(url, params=params, headers=headers, timeout=10)
         resp.raise_for_status()
         data = resp.json()
         if "result" not in data:
@@ -144,9 +150,10 @@ def _black_scholes_greeks(
 def fetch_raw_gex_data() -> Dict[str, Any]:
     now_ms = int(time.time() * 1000)
 
+    # FIX 1: Convert boolean False to string "false" for strict API validation
     instruments = _get(
         "public/get_instruments",
-        {"currency": DERIBIT_CURRENCY, "kind": "option", "expired": False},
+        {"currency": DERIBIT_CURRENCY, "kind": "option", "expired": "false"},
     )
 
     summaries = _get(
@@ -154,8 +161,13 @@ def fetch_raw_gex_data() -> Dict[str, Any]:
         {"currency": DERIBIT_CURRENCY, "kind": "option"},
     )
 
-    index_result = _get("public/get_index", {"currency": DERIBIT_CURRENCY})
-    spot = float(index_result.get(DERIBIT_CURRENCY, index_result.get("edp")))
+    # FIX 2: Replaced deprecated 'public/get_index' with 'public/get_index_price'
+    # The index name is usually 'btc_usd' or 'eth_usd'
+    index_name = f"{DERIBIT_CURRENCY.lower()}_usd"
+    index_result = _get("public/get_index_price", {"index_name": index_name})
+    
+    # Handle new response format: {"index_price": 95000.5, ...}
+    spot = float(index_result.get("index_price", index_result.get("price", 0.0)))
 
     return {
         "now_ms": now_ms,
