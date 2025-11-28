@@ -18,15 +18,21 @@ from gex_core import (
 )
 from history_bot import log_ultra, log_pretty 
 
-# --- Constants & Tuning ---
+# --- Constants & Tuning (v8.5.2 FAST REACT) ---
 
-# The BASE Delta Change required over the window to trigger a signal.
-FLOW_DELTA_REQ = 1200.0 
-SLOPE_WINDOW = 5
+# Adjusted FLOW_DELTA_REQ to 750 (was 1200) to match the shorter window.
+# We want the same "Slope Intensity" (approx 250 delta/step), just faster.
+FLOW_DELTA_REQ = 750.0 
+
+# Reduced Window from 5 -> 3. 
+# We now look at the last ~15 mins (if 5m interval) instead of 25 mins.
+SLOPE_WINDOW = 3
+
 BASE_SLOPE_THRESHOLD = FLOW_DELTA_REQ / SLOPE_WINDOW
 
-# v8.5.1: Tightened Momentum (0.20% move over window required)
-PRICE_MOMENTUM_THRESHOLD = 0.0020 
+# v8.5.2: Lowered Momentum to 0.12% (was 0.20%)
+# Captures the breakout candle earlier.
+PRICE_MOMENTUM_THRESHOLD = 0.0012 
 
 HISTORY_LEN = 12
 HEARTBEAT_MINS = 60  
@@ -74,14 +80,12 @@ def _get_confidence_stars(gamma_structure: float) -> str:
     if billions < 50: return "★★★★☆"
     return "★★★★★"
 
-# --- v8.5.1 New Logic Components ---
+# --- v8.5.2 Adaptive Logic Components ---
 
 def _get_effective_threshold(snapshot: GexSnapshot) -> float:
     """
-    v8.5.1 Adaptive Thresholds (Refined):
-    - Short Gamma: Now INVERTED.
-        * Small Structure: Higher threshold (Filter noise).
-        * Large Structure: Lower threshold (Trust the heavy flow).
+    v8.5.1 Logic Retained:
+    - Short Gamma: INVERTED (Small structure = Higher threshold/Noise filter).
     - IV: High/Rising IV increases threshold.
     """
     base = BASE_SLOPE_THRESHOLD
@@ -92,7 +96,6 @@ def _get_effective_threshold(snapshot: GexSnapshot) -> float:
     multiplier = 1.0
     
     if env == "short":
-        # GPT/Gemini Consensus:
         # If structure is SMALL (<15B), it's noisy/fragile. Be Conservative.
         if struct_g < 15_000_000_000:
             multiplier = 1.2  # Tighter (Filter chop)
@@ -126,7 +129,7 @@ def _get_effective_threshold(snapshot: GexSnapshot) -> float:
 
 def _calculate_price_momentum(window: List[GexSnapshot]) -> str:
     """
-    v8.5 Price Momentum Check.
+    v8.5.2 Price Momentum Check (Faster).
     Returns: "up" / "down" / "flat"
     """
     if not window: return "flat"
@@ -189,7 +192,7 @@ def _apply_noise_gate(delta_slope: float) -> bool:
 
 def _apply_hysteresis(raw_state: str, delta_slope: float, current_threshold: float, now: float) -> str:
     """
-    v8.5.1 Update: Emergency flip now uses the DYNAMIC threshold, not base.
+    v8.5.2 Emergency flip uses DYNAMIC threshold.
     """
     global _flow_state_internal, _last_flow_change_ts
     
@@ -271,7 +274,7 @@ def compute_directional_bias(history_window: Deque[GexSnapshot], current: GexSna
     elif delta_slope < -eff_threshold:
         delta_trend = "down"
         
-    # 3. Price Momentum (v8.5)
+    # 3. Price Momentum (v8.5.2)
     price_trend = _calculate_price_momentum(window)
     
     env = current.gamma_env 
@@ -356,7 +359,7 @@ def pretty_job() -> None:
         print(f"[PRETTY] Error: {e}")
 
 def main() -> None:
-    print("Starting GEX Bot v8.5.1 (Refined Adaptive Logic)...")
+    print("Starting GEX Bot v8.5.2 (Fast React: Window 3, Mom 0.12%)...")
     schedule.every(ULTRA_INTERVAL_MIN).minutes.do(ultra_job)
     schedule.every(PRETTY_INTERVAL_MIN).minutes.do(pretty_job)
     
