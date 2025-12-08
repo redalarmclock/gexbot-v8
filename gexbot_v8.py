@@ -48,6 +48,7 @@ NOISE_GATE_K = 0.7
 history: Deque[GexSnapshot] = deque(maxlen=HISTORY_LEN)
 last_flow_state: str = "Init"      
 last_msg_ts: float = 0.0
+last_sent_score: float = 0.0  # <--- NEW: Tracks the score of the last message sent
 
 # Internal flow engine state 
 _flow_state_internal: str = "Init"
@@ -324,7 +325,12 @@ def ultra_job() -> None:
         print(f"[ULTRA] Error: {e}")
 
 def pretty_job() -> None:
-    global last_flow_state, last_msg_ts
+    global last_flow_state, last_msg_ts, last_sent_score
+    
+    # --- Configuration ---
+    TRADE_SCORE_THRESHOLD = 6.0  # Threshold for High Conviction
+    # ---------------------
+
     try:
         raw = fetch_raw_gex_data()
         snapshot = compute_gex_snapshot(raw)
@@ -337,20 +343,56 @@ def pretty_job() -> None:
         time_since_last = now - last_msg_ts
         is_heartbeat = time_since_last > (HEARTBEAT_MINS * 60)
         
-        if current_state != last_flow_state or is_heartbeat:
-            prefix = ""
-            if current_state == last_flow_state and is_heartbeat:
-                prefix = "🔄 [Update] Regime Unchanged:\n"
+        # 1. Analyze Status
+        is_high_conviction = snapshot.trade_score >= TRADE_SCORE_THRESHOLD
+        is_new_state = current_state != last_flow_state
+        
+        # "Signal Upgrade": Same state, but score crossed from Low (<6) to High (>=6)
+        # We use 'last_sent_score' to know what the user last saw.
+        is_upgrade = (not is_new_state) and is_high_conviction and (last_sent_score < TRADE_SCORE_THRESHOLD)
+
+        should_send = False
+        prefix = ""
+        
+        # 2. Decision Logic (Priority: Upgrade > New High Signal > Heartbeat)
+        if is_upgrade:
+            # Case A: Signal Upgrade (e.g. Squeeze 4.0 -> Squeeze 8.0)
+            should_send = True
+            prefix = "🚀 [Signal Upgrade] Conviction Increased:\n"
             
+        elif is_new_state and is_high_conviction:
+            # Case B: New Signal with High Conviction (Standard Entry)
+            should_send = True
+            prefix = "🚨 [High Conviction Signal]\n"
+            
+        elif is_heartbeat:
+            # Case C: Periodic Landscape View (Hourly)
+            should_send = True
+            if is_new_state:
+                # If it changed but score is low, we just note it as an update
+                prefix = "🔄 [Update] New Regime (Low Conviction):\n"
+            else:
+                prefix = "🔄 [Update] Regime Unchanged:\n"
+        
+        # 3. Execution
+        if should_send:
             final_text = f"{prefix}{base_text}\n\n{flow_line}"
             send_message(final_text)
             
-            print(f"[PRETTY] Sent ({current_state})")
+            print(f"[PRETTY] Sent ({current_state}, Score: {snapshot.trade_score:.1f}, Upgrade: {is_upgrade})")
+            
+            # Update state trackers ONLY when we send
             last_flow_state = current_state
             last_msg_ts = now
+            last_sent_score = snapshot.trade_score
+            
         else:
-            print(f"[PRETTY] Suppressed (State: {current_state})")
+            # Suppress Noise
+            # We do NOT update last_flow_state. This is crucial.
+            # It keeps the bot "waiting" for the signal to improve.
+            print(f"[PRETTY] Suppressed ({current_state}, Score: {snapshot.trade_score:.1f})")
         
+        # 4. Logging (Always log everything for backtesting)
         row_data = snapshot_to_pretty_row(snapshot)
         row_data['flow_bias'] = flow_line
         log_pretty(row_data)
@@ -359,7 +401,7 @@ def pretty_job() -> None:
         print(f"[PRETTY] Error: {e}")
 
 def main() -> None:
-    print("Starting GEX Bot v8.5.2 (Fast React: Window 3, Mom 0.12%)...")
+    print("Starting GEX Bot v8.6 (Two-Tier + Signal Upgrade)...")
     schedule.every(ULTRA_INTERVAL_MIN).minutes.do(ultra_job)
     schedule.every(PRETTY_INTERVAL_MIN).minutes.do(pretty_job)
     
