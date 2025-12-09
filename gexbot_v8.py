@@ -1,4 +1,5 @@
 import time
+import math
 import schedule
 from collections import deque
 from typing import Deque, List, Tuple
@@ -18,10 +19,9 @@ from gex_core import (
 )
 from history_bot import log_ultra, log_pretty 
 
-# --- Constants & Tuning (v8.5.2 FAST REACT) ---
+# --- Constants & Tuning (v8.6 Combined) ---
 
 # Adjusted FLOW_DELTA_REQ to 750 (was 1200) to match the shorter window.
-# We want the same "Slope Intensity" (approx 250 delta/step), just faster.
 FLOW_DELTA_REQ = 750.0 
 
 # Reduced Window from 5 -> 3. 
@@ -48,7 +48,7 @@ NOISE_GATE_K = 0.7
 history: Deque[GexSnapshot] = deque(maxlen=HISTORY_LEN)
 last_flow_state: str = "Init"      
 last_msg_ts: float = 0.0
-last_sent_score: float = 0.0  # <--- NEW: Tracks the score of the last message sent
+last_sent_score: float = 0.0  # <--- NEW: Tracks conviction of last alert
 
 # Internal flow engine state 
 _flow_state_internal: str = "Init"
@@ -70,6 +70,24 @@ def _calculate_slope(values: List[float]) -> float:
     
     numerator = sum((xs[i] - mean_x) * (values[i] - mean_y) for i in range(n))
     denominator = sum((xs[i] - mean_x) ** 2 for i in range(n))
+    
+    return numerator / denominator if denominator != 0 else 0.0
+
+def _calculate_correlation(x: List[float], y: List[float]) -> float:
+    """Calculates Pearson correlation coefficient for Divergence checks."""
+    n = len(x)
+    if n != len(y) or n < 2:
+        return 0.0
+    
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+    
+    numerator = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+    
+    sum_sq_diff_x = sum((xi - mean_x) ** 2 for xi in x)
+    sum_sq_diff_y = sum((yi - mean_y) ** 2 for yi in y)
+    
+    denominator = math.sqrt(sum_sq_diff_x * sum_sq_diff_y)
     
     return numerator / denominator if denominator != 0 else 0.0
 
@@ -198,220 +216,3 @@ def _apply_hysteresis(raw_state: str, delta_slope: float, current_threshold: flo
     global _flow_state_internal, _last_flow_change_ts
     
     if _flow_state_internal == "Init":
-        _flow_state_internal = raw_state
-        _last_flow_change_ts = now
-        return _flow_state_internal
-    
-    # Emergency flip: Scale based on the EFFECTIVE threshold
-    if abs(delta_slope) > SLOPE_OVERSHOOT_FACTOR * current_threshold:
-        _flow_state_internal = raw_state
-        _last_flow_change_ts = now
-        return _flow_state_internal
-    
-    time_since_change = now - _last_flow_change_ts
-    _flow_raw_history.append(raw_state)
-    
-    if raw_state != _flow_state_internal:
-        if time_since_change > MIN_TIME_BETWEEN_FLOW_FLIPS:
-            if len(_flow_raw_history) >= REQUIRED_CONSEC_SAME_RAW:
-                tail = list(_flow_raw_history)[-REQUIRED_CONSEC_SAME_RAW:]
-                if all(s == raw_state for s in tail):
-                    _flow_state_internal = raw_state
-                    _last_flow_change_ts = now
-    
-    return _flow_state_internal
-
-def _present_flow(env: str, state_label: str) -> Tuple[str, str, str]:
-    display_bias = "Neutral (Vol)"
-    emoji = "⚖️"
-    desc = "Chop / No clear edge"
-    
-    if env == "short":
-        if state_label == "UP_SQUEEZE":
-            display_bias = "UP (Squeeze)"
-            emoji = "🚀"
-            desc = "Dealers chasing upside."
-        elif state_label == "DOWN_FLUSH":
-            display_bias = "DOWN (Flush)"
-            emoji = "🩸"
-            desc = "Dealers selling bounces."
-        else:
-            display_bias = "Neutral (Vol)"
-            emoji = "⚡"
-            desc = "High vol chop, balanced flows."
-    elif env == "long":
-        if state_label == "CAPPED_UP":
-            display_bias = "Capped UP"
-            emoji = "🐌"
-            desc = "Dealers selling rips (Damping)."
-        elif state_label == "FLOORED_DOWN":
-            display_bias = "Floored DOWN"
-            emoji = "🛡️"
-            desc = "Dealers buying dips (Damping)."
-        else:
-            display_bias = "Pinned"
-            emoji = "📎"
-            desc = "Mean reversion dominates."
-    
-    return display_bias, emoji, desc
-
-# --- Logic Engine ---
-
-def compute_directional_bias(history_window: Deque[GexSnapshot], current: GexSnapshot) -> Tuple[str, str]:
-    if len(history_window) < SLOPE_WINDOW: 
-        return "CALIB", "🌊 Flow: Calibrating (gathering history)..."
-    
-    window = list(history_window)[-SLOPE_WINDOW:]
-    deltas = [s.net_delta for s in window]
-    
-    # 1. Adaptive Threshold (Uses IV + Structure Inversion)
-    eff_threshold = _get_effective_threshold(current)
-    
-    # 2. Delta Trend
-    delta_slope = _calculate_slope(deltas)
-    delta_trend = "flat"
-    if delta_slope > eff_threshold:
-        delta_trend = "up"
-    elif delta_slope < -eff_threshold:
-        delta_trend = "down"
-        
-    # 3. Price Momentum (v8.5.2)
-    price_trend = _calculate_price_momentum(window)
-    
-    env = current.gamma_env 
-    
-    # 4. Classification
-    raw_state = _classify_raw_state_v85(env, delta_trend, price_trend)
-    
-    # 5. Noise Gate
-    if not _apply_noise_gate(delta_slope):
-        raw_state = "NEUTRAL_VOL"
-    
-    # 6. Hysteresis (Passes eff_threshold for emergency logic)
-    now = time.time()
-    final_state = _apply_hysteresis(raw_state, delta_slope, eff_threshold, now)
-    
-    # 7. Presentation
-    bias, emoji, desc = _present_flow(env, final_state)
-    
-    confidence = _get_confidence_stars(current.gamma_structure)
-    extras = []
-    if abs(current.gamma_tactical) > 5_000_000_000: extras.append("⚠️ 0DTE Vol Risk")
-    if current.wide_range_flag: extras.append("🌊 Wide Range")
-    
-    extra_str = f" | {' '.join(extras)}" if extras else ""
-    
-    formatted_text = (
-        f"{emoji} Flow: {bias}{extra_str}\n"
-        f"   💪 Conf: {confidence}\n"
-        f"   👉 {desc}"
-    )
-    
-    return final_state, formatted_text
-
-# --- Jobs ---
-
-def ultra_job() -> None:
-    try:
-        raw = fetch_raw_gex_data()
-        snapshot = compute_gex_snapshot(raw)
-        history.append(snapshot)
-        
-        text = format_ultra(snapshot)
-        send_message(text)
-        log_ultra(snapshot_to_ultra_row(snapshot))
-        print("[ULTRA] Sent + Logged")
-    except Exception as e:
-        print(f"[ULTRA] Error: {e}")
-
-def pretty_job() -> None:
-    global last_flow_state, last_msg_ts, last_sent_score
-    
-    # --- Configuration ---
-    TRADE_SCORE_THRESHOLD = 6.0  # Threshold for High Conviction
-    # ---------------------
-
-    try:
-        raw = fetch_raw_gex_data()
-        snapshot = compute_gex_snapshot(raw)
-        history.append(snapshot)
-
-        base_text = format_pretty(snapshot)
-        current_state, flow_line = compute_directional_bias(history, snapshot)
-        
-        now = time.time()
-        time_since_last = now - last_msg_ts
-        is_heartbeat = time_since_last > (HEARTBEAT_MINS * 60)
-        
-        # 1. Analyze Status
-        is_high_conviction = snapshot.trade_score >= TRADE_SCORE_THRESHOLD
-        is_new_state = current_state != last_flow_state
-        
-        # "Signal Upgrade": Same state, but score crossed from Low (<6) to High (>=6)
-        # We use 'last_sent_score' to know what the user last saw.
-        is_upgrade = (not is_new_state) and is_high_conviction and (last_sent_score < TRADE_SCORE_THRESHOLD)
-
-        should_send = False
-        prefix = ""
-        
-        # 2. Decision Logic (Priority: Upgrade > New High Signal > Heartbeat)
-        if is_upgrade:
-            # Case A: Signal Upgrade (e.g. Squeeze 4.0 -> Squeeze 8.0)
-            should_send = True
-            prefix = "🚀 [Signal Upgrade] Conviction Increased:\n"
-            
-        elif is_new_state and is_high_conviction:
-            # Case B: New Signal with High Conviction (Standard Entry)
-            should_send = True
-            prefix = "🚨 [High Conviction Signal]\n"
-            
-        elif is_heartbeat:
-            # Case C: Periodic Landscape View (Hourly)
-            should_send = True
-            if is_new_state:
-                # If it changed but score is low, we just note it as an update
-                prefix = "🔄 [Update] New Regime (Low Conviction):\n"
-            else:
-                prefix = "🔄 [Update] Regime Unchanged:\n"
-        
-        # 3. Execution
-        if should_send:
-            final_text = f"{prefix}{base_text}\n\n{flow_line}"
-            send_message(final_text)
-            
-            print(f"[PRETTY] Sent ({current_state}, Score: {snapshot.trade_score:.1f}, Upgrade: {is_upgrade})")
-            
-            # Update state trackers ONLY when we send
-            last_flow_state = current_state
-            last_msg_ts = now
-            last_sent_score = snapshot.trade_score
-            
-        else:
-            # Suppress Noise
-            # We do NOT update last_flow_state. This is crucial.
-            # It keeps the bot "waiting" for the signal to improve.
-            print(f"[PRETTY] Suppressed ({current_state}, Score: {snapshot.trade_score:.1f})")
-        
-        # 4. Logging (Always log everything for backtesting)
-        row_data = snapshot_to_pretty_row(snapshot)
-        row_data['flow_bias'] = flow_line
-        log_pretty(row_data)
-        
-    except Exception as e:
-        print(f"[PRETTY] Error: {e}")
-
-def main() -> None:
-    print("Starting GEX Bot v8.6 (Two-Tier + Signal Upgrade)...")
-    schedule.every(ULTRA_INTERVAL_MIN).minutes.do(ultra_job)
-    schedule.every(PRETTY_INTERVAL_MIN).minutes.do(pretty_job)
-    
-    ultra_job()
-    time.sleep(2)
-    pretty_job()
-    
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
-
-if __name__ == "__main__":
-    main()
