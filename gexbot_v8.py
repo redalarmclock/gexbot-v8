@@ -48,6 +48,32 @@ last_snapshot: Optional[GexSnapshot] = None
 
 
 # ---------------------------
+# Output Cleanup (Hard Structure Only)
+# ---------------------------
+
+def _strip_pretty_noise(text: str) -> str:
+    """
+    Remove non-structural / interpretive lines from format_pretty output.
+    Keeps the Pretty block desk-grade: hard numbers + levels only.
+    """
+    DROP_PREFIXES = (
+        "• Trade zone:",
+        "• Trade note:",
+        "• Bounce map:",
+        "• IV:",
+        "• Regime stability:",
+    )
+
+    cleaned_lines: List[str] = []
+    for line in text.splitlines():
+        if line.strip().startswith(DROP_PREFIXES):
+            continue
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines)
+
+
+# ---------------------------
 # Parsing Helpers
 # ---------------------------
 
@@ -65,7 +91,6 @@ def _parse_wall_string(wall_str: str) -> List[Dict[str, Any]]:
     if not wall_str or wall_str.strip() in {"—", "—/—"}:
         return []
 
-    # Split by pipes (your top_walls are pipe-separated)
     raw_items = re.split(r"\s*\|\s*", wall_str)
     parsed: List[Dict[str, Any]] = []
 
@@ -85,10 +110,6 @@ def _parse_wall_string(wall_str: str) -> List[Dict[str, Any]]:
 def _format_billions(val: float) -> str:
     b = val / 1_000_000_000.0
     return f"{b:+.1f}B"
-
-
-def _abs_or_zero(x: Optional[float]) -> float:
-    return abs(x) if isinstance(x, (int, float)) else 0.0
 
 
 def _level_exists(x: Optional[float]) -> bool:
@@ -181,7 +202,10 @@ def analyze_structural_changes(prev: GexSnapshot, curr: GexSnapshot) -> Tuple[bo
 
     # Flip may appear/disappear or move
     if _level_exists(prev.flip) != _level_exists(curr.flip):
-        changes.append(f"🧷 **Flip Changed**: {prev.flip if prev.flip is not None else '—'} → {curr.flip if curr.flip is not None else '—'}")
+        changes.append(
+            f"🧷 **Flip Changed**: "
+            f"{prev.flip if prev.flip is not None else '—'} → {curr.flip if curr.flip is not None else '—'}"
+        )
         should_alert = True
     elif _level_exists(prev.flip) and _level_exists(curr.flip):
         if abs(curr.flip - prev.flip) > LEVEL_MOVE_THRESHOLD:
@@ -240,7 +264,7 @@ def pretty_job() -> None:
                 header_prefix = "⏱️ **Hourly Heartbeat** (Structure Stable)\n"
 
         if should_send:
-            base_text = format_pretty(snapshot)
+            base_text = _strip_pretty_noise(format_pretty(snapshot))
             final_text = f"{header_prefix}{change_text}{base_text}"
             send_message(final_text)
             print(f"[PRETTY] Sent. (Heartbeat: {is_heartbeat})")
@@ -267,6 +291,7 @@ def main() -> None:
         f"Level move > {LEVEL_MOVE_THRESHOLD}"
     )
 
+    # Run immediately
     ultra_job()
     time.sleep(2)
     pretty_job()
