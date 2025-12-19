@@ -1,454 +1,283 @@
 import time
-import math
+import re
 import schedule
 from collections import deque
-from typing import Deque, List, Tuple
+from typing import Deque, List, Optional, Tuple, Dict, Any
 
+# Keep your existing config/utils
 from config import ULTRA_INTERVAL_MIN, PRETTY_INTERVAL_MIN
 from telegram_utils import send_message
 
-# Import core logic
+# Import core logic (NO changes needed in gex_core.py)
 from gex_core import (
-    fetch_raw_gex_data, 
-    compute_gex_snapshot, 
-    format_ultra, 
-    format_pretty, 
+    fetch_raw_gex_data,
+    compute_gex_snapshot,
+    format_pretty,
     GexSnapshot,
     snapshot_to_ultra_row,
-    snapshot_to_pretty_row
+    snapshot_to_pretty_row,
 )
-from history_bot import log_ultra, log_pretty 
 
-# --- Constants & Tuning (v8.6 Combined) ---
+from history_bot import log_ultra, log_pretty
 
-# Adjusted FLOW_DELTA_REQ to 750 (was 1200) to match the shorter window.
-FLOW_DELTA_REQ = 750.0 
+# ============================================================
+# V9 — HARD STRUCTURE BOT (Professional Grade)
+# ============================================================
 
-# Reduced Window from 5 -> 3. 
-# We now look at the last ~15 mins (if 5m interval) instead of 25 mins.
-SLOPE_WINDOW = 3
+# --- Constants & Tuning ---
 
-BASE_SLOPE_THRESHOLD = FLOW_DELTA_REQ / SLOPE_WINDOW
+# Gamma thresholds (USD)
+GAMMA_STRUCTURAL_THRESHOLD_ABS = 2_000_000_000.0   # 2B absolute
+GAMMA_STRUCTURAL_THRESHOLD_PCT = 0.08              # 8% of prior struct gamma magnitude (relative)
+GAMMA_TACTICAL_THRESHOLD_ABS = 500_000_000.0       # 0.5B absolute (<=24h gamma can be noisier)
 
-# v8.5.2: Lowered Momentum to 0.12% (was 0.20%)
-# Captures the breakout candle earlier.
-PRICE_MOMENTUM_THRESHOLD = 0.0012 
+# Wall resize sensitivity
+WALL_SIZE_CHANGE_PCT = 0.20                        # 20% magnitude change
+WALL_SIZE_CHANGE_ABS_FLOOR = 800_000_000.0         # 0.8B floor to prevent tiny-wall % noise
 
-HISTORY_LEN = 12
-HEARTBEAT_MINS = 60  
+# Magnet/Flip movement tolerance (in price dollars)
+LEVEL_MOVE_THRESHOLD = 500
 
-# Flow Stability Tuning
-MIN_TIME_BETWEEN_FLOW_FLIPS = 10 * 60      
-REQUIRED_CONSEC_SAME_RAW = 2               
-SLOPE_OVERSHOOT_FACTOR = 1.2               
-NOISE_GATE_WINDOW = 6                       
-NOISE_GATE_K = 0.7                          
+# Heartbeat
+HEARTBEAT_MINS = 60
 
-# --- State Management ---
-history: Deque[GexSnapshot] = deque(maxlen=HISTORY_LEN)
-last_flow_state: str = "Init"      
+# --- State ---
+history: Deque[GexSnapshot] = deque(maxlen=24)      # ~6 hours if pretty is 15m
 last_msg_ts: float = 0.0
-last_sent_score: float = 0.0  # <--- NEW: Tracks conviction of last alert
+last_snapshot: Optional[GexSnapshot] = None
 
-# Internal flow engine state 
-_flow_state_internal: str = "Init"
-_last_flow_change_ts: float = 0.0
-_flow_raw_history: Deque[str] = deque(maxlen=HISTORY_LEN)
-_delta_slope_history: Deque[float] = deque(maxlen=HISTORY_LEN)
 
-# --- Trend Math ---
+# ---------------------------
+# Parsing Helpers
+# ---------------------------
 
-def _calculate_slope(values: List[float]) -> float:
-    """Calculates Linear Regression Slope (Least Squares)"""
-    n = len(values)
-    if n < 2:
-        return 0.0
-    
-    xs = list(range(n))
-    mean_x = sum(xs) / n
-    mean_y = sum(values) / n
-    
-    numerator = sum((xs[i] - mean_x) * (values[i] - mean_y) for i in range(n))
-    denominator = sum((xs[i] - mean_x) ** 2 for i in range(n))
-    
-    return numerator / denominator if denominator != 0 else 0.0
+_WALL_ITEM_RE = re.compile(
+    r"([\d,]+)\s*\(\s*([+-]?\d+(?:\.\d+)?)M\s*([RS])\s*\)"
+)
 
-def _calculate_correlation(x: List[float], y: List[float]) -> float:
-    """Calculates Pearson correlation coefficient for Divergence checks."""
-    n = len(x)
-    if n != len(y) or n < 2:
-        return 0.0
-    
-    mean_x = sum(x) / n
-    mean_y = sum(y) / n
-    
-    numerator = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
-    
-    sum_sq_diff_x = sum((xi - mean_x) ** 2 for xi in x)
-    sum_sq_diff_y = sum((yi - mean_y) ** 2 for yi in y)
-    
-    denominator = math.sqrt(sum_sq_diff_x * sum_sq_diff_y)
-    
-    return numerator / denominator if denominator != 0 else 0.0
-
-def _get_confidence_stars(gamma_structure: float) -> str:
-    billions = abs(gamma_structure) / 1_000_000_000
-    if billions < 5: return "★☆☆☆☆"
-    if billions < 15: return "★★☆☆☆"
-    if billions < 30: return "★★★☆☆"
-    if billions < 50: return "★★★★☆"
-    return "★★★★★"
-
-# --- v8.5.2 Adaptive Logic Components ---
-
-def _get_effective_threshold(snapshot: GexSnapshot) -> float:
+def _parse_wall_string(wall_str: str) -> List[Dict[str, Any]]:
     """
-    v8.5.1 Logic Retained:
-    - Short Gamma: INVERTED (Small structure = Higher threshold/Noise filter).
-    - IV: High/Rising IV increases threshold.
+    Parses formatted walls like:
+      '95,000 (-5997.99M R) | 90,000 (-5541.03M R) | 85,000 (-4016.77M R)'
+    into structured data:
+      [{'strike': 95000, 'size': -5.99799e9, 'dir': 'R'}, ...]
     """
-    base = BASE_SLOPE_THRESHOLD
-    struct_g = abs(snapshot.gamma_structure)
-    env = snapshot.gamma_env
-    
-    # 1. Base Environment Multiplier
-    multiplier = 1.0
-    
-    if env == "short":
-        # If structure is SMALL (<15B), it's noisy/fragile. Be Conservative.
-        if struct_g < 15_000_000_000:
-            multiplier = 1.2  # Tighter (Filter chop)
-        # If structure is HUGE (>35B), moves are real. Be Sensitive.
-        elif struct_g > 35_000_000_000:
-            multiplier = 0.8  # Looser (Catch the trend)
+    if not wall_str or wall_str.strip() in {"—", "—/—"}:
+        return []
+
+    # Split by pipes (your top_walls are pipe-separated)
+    raw_items = re.split(r"\s*\|\s*", wall_str)
+    parsed: List[Dict[str, Any]] = []
+
+    for item in raw_items:
+        m = _WALL_ITEM_RE.search(item)
+        if not m:
+            continue
+        strike = int(m.group(1).replace(",", ""))
+        size_m = float(m.group(2))                 # can be negative
+        size = size_m * 1_000_000.0               # M -> USD
+        direction = m.group(3)
+        parsed.append({"strike": strike, "size": size, "dir": direction})
+
+    return parsed
+
+
+def _format_billions(val: float) -> str:
+    b = val / 1_000_000_000.0
+    return f"{b:+.1f}B"
+
+
+def _abs_or_zero(x: Optional[float]) -> float:
+    return abs(x) if isinstance(x, (int, float)) else 0.0
+
+
+def _level_exists(x: Optional[float]) -> bool:
+    return isinstance(x, (int, float))
+
+
+# ---------------------------
+# Structural Change Engine
+# ---------------------------
+
+def _struct_gamma_threshold(prev_struct: float) -> float:
+    """
+    Hybrid threshold: max(absolute floor, % of previous magnitude).
+    Prevents 2B being too small in extreme regimes and too large in quiet regimes.
+    """
+    prev_mag = abs(prev_struct)
+    return max(GAMMA_STRUCTURAL_THRESHOLD_ABS, GAMMA_STRUCTURAL_THRESHOLD_PCT * prev_mag)
+
+
+def analyze_structural_changes(prev: GexSnapshot, curr: GexSnapshot) -> Tuple[bool, List[str]]:
+    changes: List[str] = []
+    should_alert = False
+
+    # 1) Range boundaries (board size)
+    if prev.strong_range != curr.strong_range:
+        changes.append(f"📐 **Strong Range Shift**: {prev.strong_range} → {curr.strong_range}")
+        should_alert = True
+
+    if prev.near_range != curr.near_range:
+        changes.append(f"🧭 **Near Range Shift**: {prev.near_range} → {curr.near_range}")
+        should_alert = True
+
+    # 2) Gamma hard numbers (structure + tactical)
+    diff_struct = curr.gamma_structure - prev.gamma_structure
+    struct_thr = _struct_gamma_threshold(prev.gamma_structure)
+    if abs(diff_struct) >= struct_thr:
+        changes.append(f"🌊 **Struct Γ**: {_format_billions(diff_struct)} (thr {_format_billions(struct_thr)})")
+        should_alert = True
+
+    diff_tact = curr.gamma_tactical - prev.gamma_tactical
+    if abs(diff_tact) >= GAMMA_TACTICAL_THRESHOLD_ABS:
+        changes.append(f"⚡ **Tactical Γ**: {_format_billions(diff_tact)}")
+        should_alert = True
+
+    # 3) Regime flip (game state)
+    if prev.gamma_env != curr.gamma_env:
+        changes.append(f"🔄 **Regime Flip**: {prev.gamma_env.upper()} → {curr.gamma_env.upper()}")
+        should_alert = True
+
+    # 4) Top wall logic (king level + magnitude)
+    prev_walls = _parse_wall_string(prev.top_walls)
+    curr_walls = _parse_wall_string(curr.top_walls)
+
+    if prev_walls and curr_walls:
+        prev_top = prev_walls[0]
+        curr_top = curr_walls[0]
+
+        # A) Strike moved
+        if prev_top["strike"] != curr_top["strike"]:
+            changes.append(f"🧱 **Top Wall Moved**: {prev_top['strike']} → {curr_top['strike']}")
+            should_alert = True
         else:
-            multiplier = 1.0  # Standard
-            
-    elif env == "long":
-        # Long Gamma dampens vol. We need a strong signal to care.
-        multiplier = 1.1
-        
-    else: # Flat
-        # Noise factory. Clamp hard.
-        multiplier = 1.6
-        
-    # 2. Stability & IV Adjustment
-    
-    # IV Check: High Volatility = High Noise. Require stronger signal.
-    if "High" in snapshot.atm_iv_regime or "Rising" in snapshot.atm_iv_trend:
-        multiplier *= 1.2
-        
-    # Stability Check
-    if "Stable" in snapshot.regime_stability_label:
-        multiplier *= 0.9  # Trust stable regimes more
-    elif "Chaotic" in snapshot.regime_stability_label:
-        multiplier *= 1.3  # Don't trust chaos
-        
-    return base * multiplier
+            # B) Size changed materially (use magnitude; your sizes can be negative)
+            prev_sz = abs(prev_top["size"])
+            curr_sz = abs(curr_top["size"])
 
-def _calculate_price_momentum(window: List[GexSnapshot]) -> str:
-    """
-    v8.5.2 Price Momentum Check (Faster).
-    Returns: "up" / "down" / "flat"
-    """
-    if not window: return "flat"
-    
-    prices = [s.spot for s in window]
-    start_p = prices[0]
-    end_p = prices[-1]
-    
-    pct_change = (end_p - start_p) / start_p
-    
-    if pct_change > PRICE_MOMENTUM_THRESHOLD:
-        return "up"
-    elif pct_change < -PRICE_MOMENTUM_THRESHOLD:
-        return "down"
-    return "flat"
+            if prev_sz > 0:
+                abs_diff = abs(curr_sz - prev_sz)
+                pct_diff = (curr_sz - prev_sz) / prev_sz
 
-def _classify_raw_state_v85(env: str, delta_trend: str, price_trend: str) -> str:
-    """
-    v8.5 Combined Classification:
-    Requires Delta AND Price to agree for a directional signal.
-    """
-    if env == "short":
-        # Short Gamma: Dealers Sell Dips / Buy Rips.
-        # SQUEEZE: Delta Falling (Buying Futures) + Price Rising.
-        if delta_trend == "down" and price_trend == "up":
-            return "UP_SQUEEZE"
-        # FLUSH: Delta Rising (Selling Futures) + Price Falling.
-        elif delta_trend == "up" and price_trend == "down":
-            return "DOWN_FLUSH"
-        
-        else:
-            return "NEUTRAL_VOL"
+                if abs_diff >= WALL_SIZE_CHANGE_ABS_FLOOR and abs(pct_diff) >= WALL_SIZE_CHANGE_PCT:
+                    direction = "Reinforced" if pct_diff > 0 else "Decaying"
+                    changes.append(
+                        f"🧱 **Top Wall {direction}**: {pct_diff:+.0%} "
+                        f"(≈{curr_sz/1e9:.1f}B, Δ≈{abs_diff/1e9:.1f}B)"
+                    )
+                    should_alert = True
 
-    elif env == "long":
-        # Long Gamma: Dealers Sell Rips / Buy Dips.
-        if delta_trend == "down": # Buying
-            if price_trend == "down": return "FLOORED_DOWN" # Buying into the drop
-            return "PINNED" 
-        elif delta_trend == "up": # Selling
-            if price_trend == "up": return "CAPPED_UP" # Selling into the rally
-            return "PINNED"
-        else:
-            return "PINNED"
-            
-    else:
-        return "NEUTRAL_VOL"
+    # 5) Band walls (internal structure)
+    # Your core sorts band walls by strike, so string diff is a meaningful reshuffle signal.
+    if prev.band_walls != curr.band_walls:
+        changes.append("🏗️ **Band Re-shuffle**: Internal band levels changed.")
+        should_alert = True
 
-def _apply_noise_gate(delta_slope: float) -> bool:
-    _delta_slope_history.append(delta_slope)
-    if len(_delta_slope_history) < NOISE_GATE_WINDOW:
-        return True
-    
-    window = list(_delta_slope_history)[-NOISE_GATE_WINDOW:]
-    mean = sum(window) / len(window)
-    var = sum((x - mean) ** 2 for x in window) / len(window)
-    std = var ** 0.5
-    
-    if std == 0: return True
-    return abs(delta_slope) >= NOISE_GATE_K * std
+    # 6) Magnet / Flip (gravity points)
+    if _level_exists(prev.magnet) and _level_exists(curr.magnet):
+        if abs(curr.magnet - prev.magnet) > LEVEL_MOVE_THRESHOLD:
+            changes.append(f"🧲 **Magnet Moved**: {int(prev.magnet)} → {int(curr.magnet)}")
+            should_alert = True
 
-def _apply_hysteresis(raw_state: str, delta_slope: float, current_threshold: float, now: float) -> str:
-    """
-    v8.5.2 Emergency flip uses DYNAMIC threshold.
-    """
-    global _flow_state_internal, _last_flow_change_ts
-    
-    if _flow_state_internal == "Init":
-        _flow_state_internal = raw_state
-        _last_flow_change_ts = now
-        return _flow_state_internal
-    
-    # Emergency flip: Scale based on the EFFECTIVE threshold
-    if abs(delta_slope) > SLOPE_OVERSHOOT_FACTOR * current_threshold:
-        _flow_state_internal = raw_state
-        _last_flow_change_ts = now
-        return _flow_state_internal
-    
-    time_since_change = now - _last_flow_change_ts
-    _flow_raw_history.append(raw_state)
-    
-    if raw_state != _flow_state_internal:
-        if time_since_change > MIN_TIME_BETWEEN_FLOW_FLIPS:
-            if len(_flow_raw_history) >= REQUIRED_CONSEC_SAME_RAW:
-                tail = list(_flow_raw_history)[-REQUIRED_CONSEC_SAME_RAW:]
-                if all(s == raw_state for s in tail):
-                    _flow_state_internal = raw_state
-                    _last_flow_change_ts = now
-    
-    return _flow_state_internal
+    # Flip may appear/disappear or move
+    if _level_exists(prev.flip) != _level_exists(curr.flip):
+        changes.append(f"🧷 **Flip Changed**: {prev.flip if prev.flip is not None else '—'} → {curr.flip if curr.flip is not None else '—'}")
+        should_alert = True
+    elif _level_exists(prev.flip) and _level_exists(curr.flip):
+        if abs(curr.flip - prev.flip) > LEVEL_MOVE_THRESHOLD:
+            changes.append(f"🧷 **Flip Moved**: {int(prev.flip)} → {int(curr.flip)}")
+            should_alert = True
 
-def _present_flow(env: str, state_label: str) -> Tuple[str, str, str]:
-    display_bias = "Neutral (Vol)"
-    emoji = "⚖️"
-    desc = "Chop / No clear edge"
-    
-    if env == "short":
-        if state_label == "UP_SQUEEZE":
-            display_bias = "UP (Squeeze)"
-            emoji = "🚀"
-            desc = "Dealers chasing upside."
-        elif state_label == "DOWN_FLUSH":
-            display_bias = "DOWN (Flush)"
-            emoji = "🩸"
-            desc = "Dealers selling bounces."
-        else:
-            display_bias = "Neutral (Vol)"
-            emoji = "⚡"
-            desc = "High vol chop, balanced flows."
-    elif env == "long":
-        if state_label == "CAPPED_UP":
-            display_bias = "Capped UP"
-            emoji = "🐌"
-            desc = "Dealers selling rips (Damping)."
-        elif state_label == "FLOORED_DOWN":
-            display_bias = "Floored DOWN"
-            emoji = "🛡️"
-            desc = "Dealers buying dips (Damping)."
-        else:
-            display_bias = "Pinned"
-            emoji = "📎"
-            desc = "Mean reversion dominates."
-    
-    return display_bias, emoji, desc
+    return should_alert, changes
 
-# --- Logic Engine ---
 
-def compute_directional_bias(history_window: Deque[GexSnapshot], current: GexSnapshot) -> Tuple[str, str]:
-    if len(history_window) < SLOPE_WINDOW: 
-        return "CALIB", "🌊 Flow: Calibrating (gathering history)..."
-    
-    # Use the full 12-period window for Correlation to be statistically significant
-    full_window = list(history_window)
-    
-    # --- 1. Correlation Check (Divergence Engine) ---
-    corr_spots = [s.spot for s in full_window]
-    corr_deltas = [s.net_delta for s in full_window]
-    
-    correlation = _calculate_correlation(corr_spots, corr_deltas)
-    
-    corr_label = ""
-    # In negative gamma (normal), corr should be near -1.0
-    if correlation > -0.5:
-        corr_label = "⚠️ Div"   # Divergence: Delta detached from Price
-    elif correlation < -0.9:
-        corr_label = "🔒 Lock"  # Normal: Delta driving Price
-    else:
-        corr_label = "⚠️ Warn"  # Weakening structure
-
-    # --- 2. Slope Calculation (Trend Engine) ---
-    # Use shorter window for fast reaction
-    window = full_window[-SLOPE_WINDOW:]
-    deltas = [s.net_delta for s in window]
-    
-    eff_threshold = _get_effective_threshold(current)
-    delta_slope = _calculate_slope(deltas)
-    
-    delta_trend = "flat"
-    if delta_slope > eff_threshold:
-        delta_trend = "up"
-    elif delta_slope < -eff_threshold:
-        delta_trend = "down"
-        
-    # --- 3. Price Momentum ---
-    price_trend = _calculate_price_momentum(window)
-    
-    env = current.gamma_env 
-    
-    # --- 4. Classification ---
-    raw_state = _classify_raw_state_v85(env, delta_trend, price_trend)
-    
-    # --- 5. Noise Gate ---
-    if not _apply_noise_gate(delta_slope):
-        raw_state = "NEUTRAL_VOL"
-    
-    # --- 6. Hysteresis ---
-    now = time.time()
-    final_state = _apply_hysteresis(raw_state, delta_slope, eff_threshold, now)
-    
-    # --- 7. Presentation ---
-    bias, emoji, desc = _present_flow(env, final_state)
-    
-    confidence = _get_confidence_stars(current.gamma_structure)
-    extras = []
-    if abs(current.gamma_tactical) > 5_000_000_000: extras.append("⚠️ 0DTE Vol Risk")
-    if current.wide_range_flag: extras.append("🌊 Wide Range")
-    
-    extra_str = f" | {' '.join(extras)}" if extras else ""
-    
-    formatted_text = (
-        f"{emoji} Flow: {bias}{extra_str}\n"
-        f"   💪 Conf: {confidence}\n"
-        f"   🔗 Corr: {correlation:.2f} ({corr_label})\n"
-        f"   👉 {desc}"
-    )
-    
-    return final_state, formatted_text
-
-# --- Jobs ---
+# ---------------------------
+# Jobs
+# ---------------------------
 
 def ultra_job() -> None:
+    """
+    Logging only. Ultra is silent to keep Telegram clean.
+    """
     try:
         raw = fetch_raw_gex_data()
         snapshot = compute_gex_snapshot(raw)
         history.append(snapshot)
-        
-        text = format_ultra(snapshot)
-        send_message(text)
+
         log_ultra(snapshot_to_ultra_row(snapshot))
-        print("[ULTRA] Sent + Logged")
+        print(f"[ULTRA] {snapshot.now_ms} Logged (Silent)")
     except Exception as e:
         print(f"[ULTRA] Error: {e}")
 
+
 def pretty_job() -> None:
-    global last_flow_state, last_msg_ts, last_sent_score
-    
-    # --- Configuration ---
-    TRADE_SCORE_THRESHOLD = 6.0  # Threshold for High Conviction
-    # ---------------------
+    global last_msg_ts, last_snapshot
 
     try:
         raw = fetch_raw_gex_data()
         snapshot = compute_gex_snapshot(raw)
-        history.append(snapshot)
 
-        base_text = format_pretty(snapshot)
-        current_state, flow_line = compute_directional_bias(history, snapshot)
-        
         now = time.time()
         time_since_last = now - last_msg_ts
         is_heartbeat = time_since_last > (HEARTBEAT_MINS * 60)
-        
-        # 1. Analyze Status
-        is_high_conviction = snapshot.trade_score >= TRADE_SCORE_THRESHOLD
-        is_new_state = current_state != last_flow_state
-        
-        # "Signal Upgrade": Same state, but score crossed from Low (<6) to High (>=6)
-        # We use 'last_sent_score' to know what the user last saw.
-        is_upgrade = (not is_new_state) and is_high_conviction and (last_sent_score < TRADE_SCORE_THRESHOLD)
 
         should_send = False
-        prefix = ""
-        
-        # 2. Decision Logic (Priority: Upgrade > New High Signal > Heartbeat)
-        if is_upgrade:
-            # Case A: Signal Upgrade (e.g. Squeeze 4.0 -> Squeeze 8.0)
+        header_prefix = ""
+        change_text = ""
+
+        if last_snapshot is None:
             should_send = True
-            prefix = "🚀 [Signal Upgrade] Conviction Increased:\n"
-            
-        elif is_new_state and is_high_conviction:
-            # Case B: New Signal with High Conviction (Standard Entry)
-            should_send = True
-            prefix = "🚨 [High Conviction Signal]\n"
-            
-        elif is_heartbeat:
-            # Case C: Periodic Landscape View (Hourly)
-            should_send = True
-            if is_new_state:
-                # If it changed but score is low, we just note it as an update
-                prefix = "🔄 [Update] New Regime (Low Conviction):\n"
-            else:
-                prefix = "🔄 [Update] Regime Unchanged:\n"
-        
-        # 3. Execution
-        if should_send:
-            final_text = f"{prefix}{base_text}\n\n{flow_line}"
-            send_message(final_text)
-            
-            print(f"[PRETTY] Sent ({current_state}, Score: {snapshot.trade_score:.1f}, Upgrade: {is_upgrade})")
-            
-            # Update state trackers ONLY when we send
-            last_flow_state = current_state
-            last_msg_ts = now
-            last_sent_score = snapshot.trade_score
-            
+            header_prefix = "🟢 **GEX Bot V9 Initialized (Hard Structure)**\n"
         else:
-            # Suppress Noise
-            # We do NOT update last_flow_state. This is crucial.
-            # It keeps the bot "waiting" for the signal to improve.
-            print(f"[PRETTY] Suppressed ({current_state}, Score: {snapshot.trade_score:.1f})")
-        
-        # 4. Logging (Always log everything for backtesting)
-        row_data = snapshot_to_pretty_row(snapshot)
-        row_data['flow_bias'] = flow_line
-        log_pretty(row_data)
-        
+            is_change, changes = analyze_structural_changes(last_snapshot, snapshot)
+
+            if is_change:
+                should_send = True
+                header_prefix = "🚨 **STRUCTURE CHANGE**\n"
+                change_text = "\n".join([f"• {c}" for c in changes]) + "\n\n"
+            elif is_heartbeat:
+                should_send = True
+                header_prefix = "⏱️ **Hourly Heartbeat** (Structure Stable)\n"
+
+        if should_send:
+            base_text = format_pretty(snapshot)
+            final_text = f"{header_prefix}{change_text}{base_text}"
+            send_message(final_text)
+            print(f"[PRETTY] Sent. (Heartbeat: {is_heartbeat})")
+            last_msg_ts = now
+        else:
+            print("[PRETTY] Structure Stable. No Alert.")
+
+        # Update state + history + logs
+        last_snapshot = snapshot
+        history.append(snapshot)
+        log_pretty(snapshot_to_pretty_row(snapshot))
+
     except Exception as e:
         print(f"[PRETTY] Error: {e}")
 
+
 def main() -> None:
-    print("Starting GEX Bot v8.6 (Two-Tier + Signal Upgrade + Correlation)...")
-    schedule.every(ULTRA_INTERVAL_MIN).minutes.do(ultra_job)
-    schedule.every(PRETTY_INTERVAL_MIN).minutes.do(pretty_job)
-    
+    print("Starting GEX Bot v9 (Hard Structure)...")
+    print(
+        "Triggers: "
+        f"Struct Γ >= max({_format_billions(GAMMA_STRUCTURAL_THRESHOLD_ABS)}, {GAMMA_STRUCTURAL_THRESHOLD_PCT:.0%} prev) | "
+        f"Tactical Γ >= {_format_billions(GAMMA_TACTICAL_THRESHOLD_ABS)} | "
+        f"Top wall resize >= {WALL_SIZE_CHANGE_PCT:.0%} and >= {WALL_SIZE_CHANGE_ABS_FLOOR/1e9:.1f}B | "
+        f"Level move > {LEVEL_MOVE_THRESHOLD}"
+    )
+
     ultra_job()
     time.sleep(2)
     pretty_job()
-    
+
+    schedule.every(ULTRA_INTERVAL_MIN).minutes.do(ultra_job)
+    schedule.every(PRETTY_INTERVAL_MIN).minutes.do(pretty_job)
+
     while True:
         schedule.run_pending()
         time.sleep(1)
+
 
 if __name__ == "__main__":
     main()
