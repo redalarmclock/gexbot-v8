@@ -8,7 +8,7 @@ from typing import Deque, List, Optional, Tuple, Dict, Any
 from config import ULTRA_INTERVAL_MIN, PRETTY_INTERVAL_MIN
 from telegram_utils import send_message
 
-# Import core logic (NO changes needed in gex_core.py)
+# Import core logic
 from gex_core import (
     fetch_raw_gex_data,
     compute_gex_snapshot,
@@ -26,51 +26,27 @@ from history_bot import log_ultra, log_pretty
 
 # --- Constants & Tuning ---
 
-# Gamma thresholds (USD)
-GAMMA_STRUCTURAL_THRESHOLD_ABS = 2_000_000_000.0   # 2B absolute
-GAMMA_STRUCTURAL_THRESHOLD_PCT = 0.08              # 8% of prior struct gamma magnitude (relative)
-GAMMA_TACTICAL_THRESHOLD_ABS = 500_000_000.0       # 0.5B absolute (<=24h gamma can be noisier)
+# Gamma thresholds (USD) - Tuned for Billions
+# Alert if Structural Gamma moves by max(2B, 8% of previous)
+GAMMA_STRUCTURAL_THRESHOLD_ABS = 2_000_000_000.0   
+GAMMA_STRUCTURAL_THRESHOLD_PCT = 0.08              
+GAMMA_TACTICAL_THRESHOLD_ABS = 500_000_000.0       # 0.5B for tactical
 
 # Wall resize sensitivity
-WALL_SIZE_CHANGE_PCT = 0.20                        # 20% magnitude change
-WALL_SIZE_CHANGE_ABS_FLOOR = 800_000_000.0         # 0.8B floor to prevent tiny-wall % noise
+# Alert if a wall changes size by >20% AND >$800M (Double Filter)
+WALL_SIZE_CHANGE_PCT = 0.20                        
+WALL_SIZE_CHANGE_ABS_FLOOR = 800_000_000.0         
 
 # Magnet/Flip movement tolerance (in price dollars)
 LEVEL_MOVE_THRESHOLD = 500
 
-# Heartbeat
+# Heartbeat (Minutes)
 HEARTBEAT_MINS = 60
 
 # --- State ---
-history: Deque[GexSnapshot] = deque(maxlen=24)      # ~6 hours if pretty is 15m
+history: Deque[GexSnapshot] = deque(maxlen=24)      
 last_msg_ts: float = 0.0
 last_snapshot: Optional[GexSnapshot] = None
-
-
-# ---------------------------
-# Output Cleanup (Hard Structure Only)
-# ---------------------------
-
-def _strip_pretty_noise(text: str) -> str:
-    """
-    Remove non-structural / interpretive lines from format_pretty output.
-    Keeps the Pretty block desk-grade: hard numbers + levels only.
-    """
-    DROP_PREFIXES = (
-        "• Trade zone:",
-        "• Trade note:",
-        "• Bounce map:",
-        "• IV:",
-        "• Regime stability:",
-    )
-
-    cleaned_lines: List[str] = []
-    for line in text.splitlines():
-        if line.strip().startswith(DROP_PREFIXES):
-            continue
-        cleaned_lines.append(line)
-
-    return "\n".join(cleaned_lines)
 
 
 # ---------------------------
@@ -83,14 +59,13 @@ _WALL_ITEM_RE = re.compile(
 
 def _parse_wall_string(wall_str: str) -> List[Dict[str, Any]]:
     """
-    Parses formatted walls like:
-      '95,000 (-5997.99M R) | 90,000 (-5541.03M R) | 85,000 (-4016.77M R)'
-    into structured data:
-      [{'strike': 95000, 'size': -5.99799e9, 'dir': 'R'}, ...]
+    Parses formatted walls like: '95,000 (-5997.99M R) | ...'
+    Handles negative numbers correctly.
     """
     if not wall_str or wall_str.strip() in {"—", "—/—"}:
         return []
 
+    # Split by pipes
     raw_items = re.split(r"\s*\|\s*", wall_str)
     parsed: List[Dict[str, Any]] = []
 
@@ -100,7 +75,7 @@ def _parse_wall_string(wall_str: str) -> List[Dict[str, Any]]:
             continue
         strike = int(m.group(1).replace(",", ""))
         size_m = float(m.group(2))                 # can be negative
-        size = size_m * 1_000_000.0               # M -> USD
+        size = size_m * 1_000_000.0                # M -> USD
         direction = m.group(3)
         parsed.append({"strike": strike, "size": size, "dir": direction})
 
@@ -122,8 +97,7 @@ def _level_exists(x: Optional[float]) -> bool:
 
 def _struct_gamma_threshold(prev_struct: float) -> float:
     """
-    Hybrid threshold: max(absolute floor, % of previous magnitude).
-    Prevents 2B being too small in extreme regimes and too large in quiet regimes.
+    Hybrid threshold: max(2B, 8% of previous magnitude).
     """
     prev_mag = abs(prev_struct)
     return max(GAMMA_STRUCTURAL_THRESHOLD_ABS, GAMMA_STRUCTURAL_THRESHOLD_PCT * prev_mag)
@@ -133,20 +107,20 @@ def analyze_structural_changes(prev: GexSnapshot, curr: GexSnapshot) -> Tuple[bo
     changes: List[str] = []
     should_alert = False
 
-    # 1) Range boundaries (board size)
+    # 1) Range boundaries (Board Size)
     if prev.strong_range != curr.strong_range:
-        changes.append(f"📐 **Strong Range Shift**: {prev.strong_range} → {curr.strong_range}")
+        changes.append(f"📐 **Strong Range**: {prev.strong_range} → {curr.strong_range}")
         should_alert = True
 
     if prev.near_range != curr.near_range:
-        changes.append(f"🧭 **Near Range Shift**: {prev.near_range} → {curr.near_range}")
+        changes.append(f"🧭 **Near Range**: {prev.near_range} → {curr.near_range}")
         should_alert = True
 
-    # 2) Gamma hard numbers (structure + tactical)
+    # 2) Gamma Hard Numbers (Fuel)
     diff_struct = curr.gamma_structure - prev.gamma_structure
     struct_thr = _struct_gamma_threshold(prev.gamma_structure)
     if abs(diff_struct) >= struct_thr:
-        changes.append(f"🌊 **Struct Γ**: {_format_billions(diff_struct)} (thr {_format_billions(struct_thr)})")
+        changes.append(f"🌊 **Struct Γ**: {_format_billions(diff_struct)}")
         should_alert = True
 
     diff_tact = curr.gamma_tactical - prev.gamma_tactical
@@ -154,12 +128,12 @@ def analyze_structural_changes(prev: GexSnapshot, curr: GexSnapshot) -> Tuple[bo
         changes.append(f"⚡ **Tactical Γ**: {_format_billions(diff_tact)}")
         should_alert = True
 
-    # 3) Regime flip (game state)
+    # 3) Regime Flip (Game State)
     if prev.gamma_env != curr.gamma_env:
         changes.append(f"🔄 **Regime Flip**: {prev.gamma_env.upper()} → {curr.gamma_env.upper()}")
         should_alert = True
 
-    # 4) Top wall logic (king level + magnitude)
+    # 4) Top Wall Logic (The King)
     prev_walls = _parse_wall_string(prev.top_walls)
     curr_walls = _parse_wall_string(curr.top_walls)
 
@@ -167,12 +141,12 @@ def analyze_structural_changes(prev: GexSnapshot, curr: GexSnapshot) -> Tuple[bo
         prev_top = prev_walls[0]
         curr_top = curr_walls[0]
 
-        # A) Strike moved
+        # A) Strike moved (King Changed)
         if prev_top["strike"] != curr_top["strike"]:
             changes.append(f"🧱 **Top Wall Moved**: {prev_top['strike']} → {curr_top['strike']}")
             should_alert = True
         else:
-            # B) Size changed materially (use magnitude; your sizes can be negative)
+            # B) Size changed materially (Reinforcement/Decay)
             prev_sz = abs(prev_top["size"])
             curr_sz = abs(curr_top["size"])
 
@@ -180,32 +154,29 @@ def analyze_structural_changes(prev: GexSnapshot, curr: GexSnapshot) -> Tuple[bo
                 abs_diff = abs(curr_sz - prev_sz)
                 pct_diff = (curr_sz - prev_sz) / prev_sz
 
+                # Double Filter: Must be >20% AND >$800M change
                 if abs_diff >= WALL_SIZE_CHANGE_ABS_FLOOR and abs(pct_diff) >= WALL_SIZE_CHANGE_PCT:
-                    direction = "Reinforced" if pct_diff > 0 else "Decaying"
+                    direction = "Reinforced" if pct_diff > 0 else "Decaying" # Logic works for Magnitude
+                    # Note: pct_diff calc on magnitude is simpler for alerts
                     changes.append(
                         f"🧱 **Top Wall {direction}**: {pct_diff:+.0%} "
-                        f"(≈{curr_sz/1e9:.1f}B, Δ≈{abs_diff/1e9:.1f}B)"
+                        f"({curr_sz/1e9:.1f}B)"
                     )
                     should_alert = True
 
-    # 5) Band walls (internal structure)
-    # Your core sorts band walls by strike, so string diff is a meaningful reshuffle signal.
+    # 5) Band Walls (Internal Structure)
     if prev.band_walls != curr.band_walls:
-        changes.append("🏗️ **Band Re-shuffle**: Internal band levels changed.")
+        changes.append("🏗️ **Band Re-shuffle**: Internal levels changed.")
         should_alert = True
 
-    # 6) Magnet / Flip (gravity points)
+    # 6) Magnet / Flip (Gravity Points)
     if _level_exists(prev.magnet) and _level_exists(curr.magnet):
         if abs(curr.magnet - prev.magnet) > LEVEL_MOVE_THRESHOLD:
             changes.append(f"🧲 **Magnet Moved**: {int(prev.magnet)} → {int(curr.magnet)}")
             should_alert = True
 
-    # Flip may appear/disappear or move
     if _level_exists(prev.flip) != _level_exists(curr.flip):
-        changes.append(
-            f"🧷 **Flip Changed**: "
-            f"{prev.flip if prev.flip is not None else '—'} → {curr.flip if curr.flip is not None else '—'}"
-        )
+        changes.append(f"🧷 **Flip Changed**: {prev.flip if prev.flip else '—'} → {curr.flip if curr.flip else '—'}")
         should_alert = True
     elif _level_exists(prev.flip) and _level_exists(curr.flip):
         if abs(curr.flip - prev.flip) > LEVEL_MOVE_THRESHOLD:
@@ -221,7 +192,7 @@ def analyze_structural_changes(prev: GexSnapshot, curr: GexSnapshot) -> Tuple[bo
 
 def ultra_job() -> None:
     """
-    Logging only. Ultra is silent to keep Telegram clean.
+    Logging only. Silent.
     """
     try:
         raw = fetch_raw_gex_data()
@@ -251,7 +222,7 @@ def pretty_job() -> None:
 
         if last_snapshot is None:
             should_send = True
-            header_prefix = "🟢 **GEX Bot V9 Initialized (Hard Structure)**\n"
+            header_prefix = "🟢 **GEX Bot V9 Initialized**\n"
         else:
             is_change, changes = analyze_structural_changes(last_snapshot, snapshot)
 
@@ -261,10 +232,10 @@ def pretty_job() -> None:
                 change_text = "\n".join([f"• {c}" for c in changes]) + "\n\n"
             elif is_heartbeat:
                 should_send = True
-                header_prefix = "⏱️ **Hourly Heartbeat** (Structure Stable)\n"
+                header_prefix = "⏱️ **Hourly Heartbeat**\n"
 
         if should_send:
-            base_text = _strip_pretty_noise(format_pretty(snapshot))
+            base_text = format_pretty(snapshot)
             final_text = f"{header_prefix}{change_text}{base_text}"
             send_message(final_text)
             print(f"[PRETTY] Sent. (Heartbeat: {is_heartbeat})")
@@ -283,13 +254,7 @@ def pretty_job() -> None:
 
 def main() -> None:
     print("Starting GEX Bot v9 (Hard Structure)...")
-    print(
-        "Triggers: "
-        f"Struct Γ >= max({_format_billions(GAMMA_STRUCTURAL_THRESHOLD_ABS)}, {GAMMA_STRUCTURAL_THRESHOLD_PCT:.0%} prev) | "
-        f"Tactical Γ >= {_format_billions(GAMMA_TACTICAL_THRESHOLD_ABS)} | "
-        f"Top wall resize >= {WALL_SIZE_CHANGE_PCT:.0%} and >= {WALL_SIZE_CHANGE_ABS_FLOOR/1e9:.1f}B | "
-        f"Level move > {LEVEL_MOVE_THRESHOLD}"
-    )
+    print(f"Triggers: Struct Gamma > 2B/8% | Wall Change > 20% & 0.8B")
 
     # Run immediately
     ultra_job()
