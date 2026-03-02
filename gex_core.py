@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -70,12 +70,10 @@ class GexSnapshot:
     band_walls: str
     band_bias: str
     band_bias_interpretation: str
-    intraday_structure: str      
+    intraday_structure: str
     delta_trend: str
     delta_trend_long: str
     wide_range_flag: str
-    interpretation: str
-    bounce_map: str
 
     # --- Metrics ---
     atm_iv: Optional[float]
@@ -83,9 +81,9 @@ class GexSnapshot:
     atm_iv_trend: str
     regime_stability_score: float
     regime_stability_label: str
-    trade_score: float
-    trade_zone: str
-    trade_note: str
+
+    # --- Strike-level GEX (for profiles, not serialised) ---
+    gex_by_strike: Optional[Dict[float, float]] = field(default=None, repr=False)
 
 
 _last_delta: Optional[float] = None
@@ -279,16 +277,23 @@ def _compute_flip(gex_by_strike: Dict[float, float]) -> Optional[float]:
     return None
 
 
-def _compute_ranges(spot: float, gex_by_strike: Dict[float, float], net_gamma: float) -> Tuple[str, str]:
+def _compute_ranges(
+    spot: float, gex_by_strike: Dict[float, float], net_gamma: float
+) -> Tuple[str, str, Optional[float], Optional[float]]:
+    """
+    Returns (near_range_str, strong_range_str, strong_low, strong_high).
+    strong_low / strong_high are the raw strike values for downstream use,
+    avoiding re-parsing the formatted string.
+    """
     if not gex_by_strike:
-        return "—/—", "—/—"
+        return "—/—", "—/—", None, None
     suffix = "R" if net_gamma < 0 else "S" if net_gamma > 0 else ""
     items = sorted(gex_by_strike.items())
     max_abs = max(abs(v) for _, v in items)
     if max_abs == 0:
-        return "—/—", "—/—"
+        return "—/—", "—/—", None, None
 
-    near_threshold = 0.10 * max_abs 
+    near_threshold = 0.10 * max_abs
     strong_threshold = 0.5 * max_abs
 
     def _pick(threshold: float) -> Tuple[Optional[float], Optional[float]]:
@@ -302,11 +307,18 @@ def _compute_ranges(spot: float, gex_by_strike: Dict[float, float], net_gamma: f
         def fmt(x: Optional[float]) -> str:
             if x is None:
                 return "—"
-            rounded = int(round(x / 1000.0) * 1000)
-            return f"{rounded}{suffix}" if suffix else f"{rounded}"
+            return f"{int(x):,}{suffix}" if suffix else f"{int(x):,}"
         return f"{fmt(below)}/{fmt(above)}"
 
-    return _fmt_pair(*_pick(near_threshold)), _fmt_pair(*_pick(strong_threshold))
+    near_below, near_above = _pick(near_threshold)
+    strong_below, strong_above = _pick(strong_threshold)
+
+    return (
+        _fmt_pair(near_below, near_above),
+        _fmt_pair(strong_below, strong_above),
+        strong_below,
+        strong_above,
+    )
 
 
 def _classify_environment(net_gamma: float) -> Tuple[str, str, str]:
@@ -348,42 +360,32 @@ def _top_gamma_walls(gex_by_strike: Dict[float, float], top_n: int = 5) -> str:
     sorted_walls = sorted(gex_by_strike.items(), key=lambda x: abs(x[1]), reverse=True)[:top_n]
     parts: List[str] = []
     for strike, gex in sorted_walls:
-        gex_m = gex / 1_000_000
+        gex_b = gex / 1_000_000_000.0
         direction = "R" if gex < 0 else "S"
-        # Allows negative M for correct V9 parsing
-        parts.append(f"{int(strike):,} ({gex_m:+.2f}M {direction})")
+        parts.append(f"{int(strike):,} ({gex_b:+.2f}B {direction})")
     return " | ".join(parts)
 
 
-def _compute_band_walls(strong_range: str, gex_by_strike: Dict[float, float]) -> str:
-    if not gex_by_strike or strong_range == "—/—":
+def _compute_band_walls(low_v: Optional[float], high_v: Optional[float], gex_by_strike: Dict[float, float]) -> str:
+    if not gex_by_strike or low_v is None or high_v is None:
         return "—"
-    try:
-        low_str, high_str = strong_range.split("/")
-        if "—" in low_str or "—" in high_str:
-            return "—"
-        low_v = int(low_str[:-1] if low_str.endswith(("R", "S")) else low_str)
-        high_v = int(high_str[:-1] if high_str.endswith(("R", "S")) else high_str)
-        if low_v > high_v:
-            low_v, high_v = high_v, low_v
-    except Exception:
-        return "—"
+    if low_v > high_v:
+        low_v, high_v = high_v, low_v
 
     band_items = [(k, v) for k, v in gex_by_strike.items() if low_v <= k <= high_v]
     threshold = 500_000_000.0
     band_items = [(k, v) for k, v in band_items if abs(v) >= threshold]
     if not band_items:
         return "—"
-    
+
     band_items = sorted(band_items, key=lambda x: abs(x[1]), reverse=True)[:4]
     band_items = sorted(band_items, key=lambda x: x[0])
 
     parts: List[str] = []
     for strike, gex in band_items:
-        strike_k = int(round(strike / 1000.0))
         direction = "R" if gex < 0 else "S"
-        gex_m = abs(gex) / 1_000_000.0
-        parts.append(f"{strike_k}k{direction} ({gex_m:.1f}M)")
+        gex_b = abs(gex) / 1_000_000_000.0
+        parts.append(f"{int(strike):,}{direction} ({gex_b:.2f}B)")
     return " | ".join(parts)
 
 
@@ -404,34 +406,31 @@ def _compute_intraday_structure(spot: float, gex_by_strike: Dict[float, float]) 
         return "— (Vacuum)"
     parts = []
     for strike, gex in significant_items:
-        k_val = strike / 1000.0
-        k_str = f"{int(k_val)}k" if k_val.is_integer() else f"{k_val:.1f}k"
         direction = "R" if gex < 0 else "S"
-        gex_m = abs(gex) / 1_000_000.0
-        parts.append(f"{k_str}{direction} ({gex_m:.0f}M)")
+        gex_b = abs(gex) / 1_000_000_000.0
+        parts.append(f"{int(strike):,}{direction} ({gex_b:.2f}B)")
     return " → ".join(parts)
 
 
-def _compute_band_bias(strong_range: str, gex_by_strike: Dict[float, float]) -> str:
-    # Logic kept for CSV
-    if not gex_by_strike or strong_range == "—/—": return "—"
-    try:
-        low_str, high_str = strong_range.split("/")
-        if "—" in low_str or "—" in high_str: return "—"
-        low_v = int(low_str[:-1] if low_str.endswith(("R", "S")) else low_str)
-        high_v = int(high_str[:-1] if high_str.endswith(("R", "S")) else high_str)
-        if low_v > high_v: low_v, high_v = high_v, low_v
-    except: return "—"
+def _compute_band_bias(low_v: Optional[float], high_v: Optional[float], gex_by_strike: Dict[float, float]) -> str:
+    if not gex_by_strike or low_v is None or high_v is None:
+        return "—"
+    if low_v > high_v:
+        low_v, high_v = high_v, low_v
 
     mid = (low_v + high_v) / 2.0
     lower_sum = sum(abs(v) for k, v in gex_by_strike.items() if low_v <= k <= mid)
     upper_sum = sum(abs(v) for k, v in gex_by_strike.items() if mid < k <= high_v)
     total = lower_sum + upper_sum
-    if total == 0: return "balanced"
+    if total == 0:
+        return "balanced"
     lower_pct = lower_sum / total
-    if lower_pct >= 0.60: return f"lower-heavy ({lower_pct*100:.0f}%)"
-    elif lower_pct <= 0.40: return f"upper-heavy ({(1-lower_pct)*100:.0f}%)"
-    else: return "balanced (≈50/50)"
+    if lower_pct >= 0.60:
+        return f"lower-heavy ({lower_pct*100:.0f}%)"
+    elif lower_pct <= 0.40:
+        return f"upper-heavy ({(1-lower_pct)*100:.0f}%)"
+    else:
+        return "balanced (≈50/50)"
 
 
 def _describe_delta_trend(diff: float, ref: float) -> str:
@@ -443,21 +442,10 @@ def _describe_delta_trend(diff: float, ref: float) -> str:
 
 
 def _interpret_band_bias(band_bias: str) -> str:
-    # Logic kept for CSV
     if not band_bias or band_bias == "—": return "Neutral"
     if "lower-heavy" in band_bias: return "Support focus"
     if "upper-heavy" in band_bias: return "Resistance focus"
     return "Balanced"
-
-
-def _compute_bounce_map(spot: float, strong_range: str, gamma_env: str, struct_gamma: float, net_delta: float) -> str:
-    # Logic kept for CSV
-    return "—"
-
-
-def _build_interpretation(spot: float, gamma_env: str, near_range: str, top_walls: str, wide_range_flag: str) -> str:
-    # Logic kept for CSV
-    return "—"
 
 
 def _compute_atm_iv(options: List[OptionPoint], spot: float, now_ms: int) -> Tuple[Optional[float], str, str]:
@@ -503,32 +491,56 @@ def _compute_atm_iv(options: List[OptionPoint], spot: float, now_ms: int) -> Tup
 
 
 def _compute_regime_stability(now_ms: int, gamma_structure: float) -> Tuple[float, str]:
+    """
+    Three-component stability score (0–100):
+
+    - 50%: Structural gamma depth. More structural GEX = harder to flip the regime.
+           Caps at 50B (reasonable max for BTC).
+    - 25%: ATM IV stability. Computed from standard deviation of IV over the last 2h.
+           Low IV variance = stable vol environment = higher score.
+           An IV std of 5 vol-points = fully unstable (score 0).
+    - 25%: Dealer delta stability. Low variance in net dealer delta over last 2h
+           means dealers are not scrambling to re-hedge = more predictable price action.
+           A delta std of 50,000 BTC = fully unstable (score 0).
+    """
+    # Component 1: Structural gamma depth (50%)
     abs_struct = abs(gamma_structure)
-    base = min(abs_struct / 50_000_000_000.0, 1.0)
+    structural_score = min(abs_struct / 50_000_000_000.0, 1.0)
 
-    if len(_delta_history) >= 2:
-        deltas = [d for (_, d) in _delta_history]
-        mean = sum(deltas) / len(deltas)
-        var = sum((d - mean) ** 2 for d in deltas) / len(deltas)
-        delta_std = var ** 0.5
+    # Component 2: ATM IV variance (25%)
+    if len(_atm_iv_history) >= 2:
+        iv_vals = [iv for (_, iv) in _atm_iv_history]
+        mean_iv = sum(iv_vals) / len(iv_vals)
+        iv_var = sum((iv - mean_iv) ** 2 for iv in iv_vals) / len(iv_vals)
+        iv_std = iv_var ** 0.5
+        # 5 vol-point std = maximally unstable; 0 = fully stable
+        iv_stability_score = max(0.0, 1.0 - min(iv_std / 5.0, 1.0))
     else:
-        delta_std = 0.0
+        iv_stability_score = 0.5  # neutral — insufficient history
 
-    delta_vol_norm = min(delta_std / 50_000.0, 1.0)
-    stability = 100.0 * (0.5 * base + 0.25 * 1.0 + 0.25 * (1.0 - delta_vol_norm))
+    # Component 3: Dealer delta stability (25%)
+    if len(_delta_history) >= 2:
+        delta_vals = [d for (_, d) in _delta_history]
+        mean_d = sum(delta_vals) / len(delta_vals)
+        d_var = sum((d - mean_d) ** 2 for d in delta_vals) / len(delta_vals)
+        delta_std = d_var ** 0.5
+        delta_stability_score = max(0.0, 1.0 - min(delta_std / 50_000.0, 1.0))
+    else:
+        delta_stability_score = 0.5  # neutral — insufficient history
+
+    stability = 100.0 * (
+        0.50 * structural_score +
+        0.25 * iv_stability_score +
+        0.25 * delta_stability_score
+    )
     stability = max(0.0, min(100.0, stability))
 
-    if stability >= 75.0: label = "🟢 Stable"
+    if stability >= 75.0:   label = "🟢 Stable"
     elif stability >= 50.0: label = "🟡 Mixed"
     elif stability >= 25.0: label = "🔴 Unstable"
-    else: label = "🔥 Chaotic"
+    else:                   label = "🔥 Chaotic"
 
     return stability, label
-
-
-def _compute_tradeability(spot: float, strong_range: str, gamma_env: str, regime_stability_label: str, band_bias: str) -> Tuple[float, str, str]:
-    # Logic kept for CSV
-    return 5.0, "Standard", "Standard"
 
 
 def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
@@ -576,10 +588,10 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
 
     magnet = _compute_magnet(gex_by_strike)
     flip = _compute_flip(gex_by_strike)
-    near_range, strong_range = _compute_ranges(spot, gex_by_strike, net_gamma)
+    near_range, strong_range, strong_low, strong_high = _compute_ranges(spot, gex_by_strike, net_gamma)
     top_walls = _top_gamma_walls(gex_by_strike)
-    band_walls = _compute_band_walls(strong_range, gex_by_strike)
-    band_bias = _compute_band_bias(strong_range, gex_by_strike)
+    band_walls = _compute_band_walls(strong_low, strong_high, gex_by_strike)
+    band_bias = _compute_band_bias(strong_low, strong_high, gex_by_strike)
     band_bias_interpretation = _interpret_band_bias(band_bias)
     intraday_structure = _compute_intraday_structure(spot, gex_by_strike)
 
@@ -597,7 +609,6 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
 
     atm_iv, atm_iv_regime, atm_iv_trend = _compute_atm_iv(options, spot, now_ms)
     regime_stability_score, regime_stability_label = _compute_regime_stability(now_ms, gamma_structure)
-    trade_score, trade_zone, trade_note = _compute_tradeability(spot, strong_range, gamma_env, regime_stability_label, band_bias)
 
     return GexSnapshot(
         spot=spot,
@@ -605,6 +616,7 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
         options=options,
         net_gamma=net_gamma,
         net_delta=net_delta,
+        gex_by_strike=gex_by_strike,
         gamma_tactical=gamma_tactical,
         gamma_structure=gamma_structure,
         expiry_outlook="Standard",
@@ -623,16 +635,11 @@ def compute_gex_snapshot(raw: Dict[str, Any]) -> GexSnapshot:
         delta_trend=delta_trend_short,
         delta_trend_long=delta_trend_long,
         wide_range_flag=wide_range_flag,
-        interpretation="—",
-        bounce_map="—",
         atm_iv=atm_iv,
         atm_iv_regime=atm_iv_regime,
         atm_iv_trend=atm_iv_trend,
         regime_stability_score=regime_stability_score,
         regime_stability_label=regime_stability_label,
-        trade_score=trade_score,
-        trade_zone=trade_zone,
-        trade_note=trade_note,
     )
 
 
@@ -644,63 +651,194 @@ def _fmt_price(p: Optional[float]) -> str:
     return f"{p:,.0f}"
 
 
+def _fmt_dist(spot: float, strike: float) -> str:
+    """Format distance from spot with arrow direction."""
+    diff = strike - spot
+    if diff >= 0:
+        return f"↑{abs(diff):,.0f}"
+    else:
+        return f"↓{abs(diff):,.0f}"
+
+
+def _build_ascii_profile(
+    spot: float,
+    gex_by_strike: Dict[float, float],
+    pct_range: float,
+    max_bar_width: int = 16,
+    min_gex_threshold: float = 0.0,
+) -> str:
+    """
+    Build an ASCII bar chart of GEX by strike within ±pct_range of spot.
+
+    Args:
+        spot: Current price
+        gex_by_strike: {strike: net_gex_usd} dict
+        pct_range: e.g. 0.05 for ±5%
+        max_bar_width: max number of bar characters
+        min_gex_threshold: minimum absolute GEX to include (filters noise)
+
+    Returns:
+        Monospace string suitable for Telegram code block.
+    """
+    low = spot * (1.0 - pct_range)
+    high = spot * (1.0 + pct_range)
+
+    # Filter to range and threshold
+    items = [
+        (k, v) for k, v in gex_by_strike.items()
+        if low <= k <= high and abs(v) >= min_gex_threshold
+    ]
+
+    if not items:
+        return "  (no significant levels in range)"
+
+    items.sort(key=lambda x: x[0])
+
+    # Find max absolute GEX for scaling bars
+    max_abs = max(abs(v) for _, v in items)
+    if max_abs == 0:
+        return "  (all levels near zero)"
+
+    # Build lines
+    lines: List[str] = []
+    spot_inserted = False
+
+    for strike, gex in items:
+        # Insert spot marker when we cross it
+        if not spot_inserted and strike >= spot:
+            spot_inserted = True
+            lines.append(f"  {'─' * 6} SPOT {int(spot):,} {'─' * 6}")
+
+        # Bar length proportional to magnitude
+        bar_len = int(round(abs(gex) / max_abs * max_bar_width))
+        bar_len = max(bar_len, 1)
+
+        # Direction: S = support (positive GEX), R = repel (negative GEX)
+        if gex >= 0:
+            bar_char = "█"
+            direction = "S"
+        else:
+            bar_char = "▓"
+            direction = "R"
+
+        bar = bar_char * bar_len
+        gex_b = gex / 1_000_000_000.0
+        dist = _fmt_dist(spot, strike)
+
+        # Fixed-width formatting for alignment
+        strike_s = f"{int(strike):>7,}"
+        gex_s = f"{gex_b:+.2f}B"
+
+        lines.append(f"  {strike_s} {bar:<{max_bar_width}} {gex_s} {direction} {dist}")
+
+    # If spot is above all strikes in range
+    if not spot_inserted:
+        lines.append(f"  {'─' * 6} SPOT {int(spot):,} {'─' * 6}")
+
+    return "\n".join(lines)
+
+
 def format_ultra(snapshot: GexSnapshot) -> str:
     return format_pretty(snapshot)
 
 
 def format_pretty(snapshot: GexSnapshot) -> str:
     """
-    Professional Grade Output: Hard Structure Only.
-    Cleanest version. No Voodoo.
+    Professional Grade Output with ASCII GEX profiles.
+    Exact strike prices. No rounding. Two views: tight and wide.
     """
-    spot_s = _fmt_price(snapshot.spot)
+    spot = snapshot.spot
+    spot_s = _fmt_price(spot)
     flip_s = (
         _fmt_price(snapshot.flip)
-        if snapshot.flip and abs(snapshot.flip - snapshot.spot) / snapshot.spot <= 0.25
+        if snapshot.flip and abs(snapshot.flip - spot) / spot <= 0.25
         else "—"
     )
     mag_s = _fmt_price(snapshot.magnet)
     delta_s = f"{snapshot.net_delta:,.0f}"
-    
-    # Billions for High Level
+
     gamma_b = snapshot.net_gamma / 1_000_000_000.0
     gt_b = snapshot.gamma_tactical / 1_000_000_000.0
     gs_b = snapshot.gamma_structure / 1_000_000_000.0
 
+    # Distance annotations for key levels
+    flip_dist = ""
+    if snapshot.flip and abs(snapshot.flip - spot) / spot <= 0.25:
+        flip_dist = f" ({_fmt_dist(spot, snapshot.flip)})"
+    mag_dist = ""
+    if snapshot.magnet:
+        mag_dist = f" ({_fmt_dist(spot, snapshot.magnet)})"
+
+    gex_by_strike = snapshot.gex_by_strike or {}
+
+    # Tight profile (±5%) — filter out noise < 0.1B
+    tight_profile = _build_ascii_profile(
+        spot, gex_by_strike, pct_range=0.05,
+        max_bar_width=14, min_gex_threshold=100_000_000.0
+    )
+
+    # Wide profile (±10%) — filter out noise < 0.5B
+    wide_profile = _build_ascii_profile(
+        spot, gex_by_strike, pct_range=0.10,
+        max_bar_width=12, min_gex_threshold=500_000_000.0
+    )
+
     lines: List[str] = [
-        f"📊 {DERIBIT_CURRENCY} GEX Update | Spot {spot_s}",
+        f"📊 {DERIBIT_CURRENCY} GEX | Spot {spot_s}",
         "",
-        f"• Env: {snapshot.gamma_env_label}",
+        f"Env: {snapshot.gamma_env_label}",
     ]
 
     if snapshot.atm_iv is not None:
-        lines.append(f"• IV: {snapshot.atm_iv:.0f}% ({snapshot.atm_iv_trend})")
-    else:
-        lines.append("• IV: —")
+        lines.append(f"IV: {snapshot.atm_iv:.0f}% ({snapshot.atm_iv_trend})")
 
     lines.extend([
         "",
-        f"• Struct Γ: {gs_b:+.1f}B",
-        f"• Tact Γ:   {gt_b:+.1f}B",
+        f"Struct Γ: {gs_b:+.1f}B | Tact Γ: {gt_b:+.1f}B",
+        f"Net Γ: {gamma_b:+.1f}B | Δ: {delta_s}",
+        f"Magnet: {mag_s}{mag_dist} | Flip: {flip_s}{flip_dist}",
+    ])
+
+    lines.extend([
         "",
-        f"• Magnet: {mag_s}  | Flip: {flip_s}",
-        f"• Net Γ: {gamma_b:+.1f}B | Δ: {delta_s}",
-        "",
-        f"• Near: {snapshot.near_range}",
-        f"• Strong: {snapshot.strong_range}",
+        f"Near: {snapshot.near_range}",
+        f"Strong: {snapshot.strong_range}",
     ])
 
     if snapshot.wide_range_flag:
-        lines.append(f"• Note: {snapshot.wide_range_flag}")
+        lines.append(f"⚠ {snapshot.wide_range_flag}")
 
-    lines.append("")
-    lines.append(f"• Walls: {snapshot.top_walls}")
-    
+    # --- Tight GEX Profile ---
+    lines.extend([
+        "",
+        "━━━ GEX LEVELS ±5% ━━━",
+        "```",
+        tight_profile,
+        "```",
+    ])
+
+    # --- Wide GEX Profile ---
+    lines.extend([
+        "",
+        "━━━ GEX LEVELS ±10% ━━━",
+        "```",
+        wide_profile,
+        "```",
+    ])
+
+    # --- Walls ---
+    lines.extend([
+        "",
+        f"Top Walls: {snapshot.top_walls}",
+    ])
+
     if snapshot.band_walls and snapshot.band_walls != "—":
-        lines.append(f"• Band: {snapshot.band_walls}")
+        lines.append(f"Band: {snapshot.band_walls}")
 
-    lines.append("")
-    lines.append(f"• Stability: {snapshot.regime_stability_label} ({snapshot.regime_stability_score:.0f})")
+    lines.extend([
+        "",
+        f"Stability: {snapshot.regime_stability_label} ({snapshot.regime_stability_score:.0f})",
+    ])
 
     return "\n".join(lines)
 
@@ -729,16 +867,11 @@ def snapshot_to_ultra_row(snapshot: GexSnapshot) -> Dict[str, Any]:
         "delta_trend_short": snapshot.delta_trend,
         "delta_trend_long": snapshot.delta_trend_long,
         "wide_range_flag": snapshot.wide_range_flag,
-        "interpretation": snapshot.interpretation,
-        "bounce_map": snapshot.bounce_map,
         "atm_iv": snapshot.atm_iv,
         "atm_iv_regime": snapshot.atm_iv_regime,
         "atm_iv_trend": snapshot.atm_iv_trend,
         "regime_stability_score": snapshot.regime_stability_score,
         "regime_stability_label": snapshot.regime_stability_label,
-        "trade_score": snapshot.trade_score,
-        "trade_zone": snapshot.trade_zone,
-        "trade_note": snapshot.trade_note,
     }
 
 

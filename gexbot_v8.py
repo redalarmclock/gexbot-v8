@@ -54,12 +54,12 @@ last_snapshot: Optional[GexSnapshot] = None
 # ---------------------------
 
 _WALL_ITEM_RE = re.compile(
-    r"([\d,]+)\s*\(\s*([+-]?\d+(?:\.\d+)?)M\s*([RS])\s*\)"
+    r"([\d,]+)\s*\(\s*([+-]?\d+(?:\.\d+)?)B\s*([RS])\s*\)"
 )
 
 def _parse_wall_string(wall_str: str) -> List[Dict[str, Any]]:
     """
-    Parses formatted walls like: '95,000 (-5997.99M R) | ...'
+    Parses formatted walls like: '95,000 (-5.99B R) | ...'
     Handles negative numbers correctly.
     """
     if not wall_str or wall_str.strip() in {"—", "—/—"}:
@@ -74,8 +74,8 @@ def _parse_wall_string(wall_str: str) -> List[Dict[str, Any]]:
         if not m:
             continue
         strike = int(m.group(1).replace(",", ""))
-        size_m = float(m.group(2))                 # can be negative
-        size = size_m * 1_000_000.0                # M -> USD
+        size_b = float(m.group(2))                 # can be negative
+        size = size_b * 1_000_000_000.0            # B -> USD
         direction = m.group(3)
         parsed.append({"strike": strike, "size": size, "dir": direction})
 
